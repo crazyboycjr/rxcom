@@ -590,6 +590,7 @@ impl Compositor {
         let sc = self.swapchain.as_ref().unwrap();
         let swfn = self.gpu.swapchain_fn.as_ref().unwrap();
         let acquired = self.frames[slot].acquired;
+        let t_acquire = Instant::now();
         let index = match unsafe { swfn.acquire_next_image(sc.swapchain, u64::MAX, acquired, vk::Fence::null()) } {
             Ok((i, _)) => i,
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
@@ -600,6 +601,7 @@ impl Compositor {
             Err(e) => return Err(e).context("vkAcquireNextImageKHR"),
         };
 
+        let acquire_ms = t_acquire.elapsed().as_secs_f64() * 1e3;
         let gpu = &*self.gpu;
         let dev = &gpu.device;
         let cmd = self.frames[slot].cmd;
@@ -727,6 +729,9 @@ impl Compositor {
             .signal_semaphore_infos(&signals)];
         unsafe { dev.queue_submit2(gpu.queue, &submit, fence)? };
         self.frames[slot].number = self.frame_no;
+        let submitted_ms = now.elapsed().as_secs_f64() * 1e3;
+        let frame_no = self.frame_no;
+        let nquads = quads.len();
         self.frame_no += 1;
 
         let swapchains = [sc.swapchain];
@@ -736,7 +741,16 @@ impl Compositor {
             .wait_semaphores(&wait)
             .swapchains(&swapchains)
             .image_indices(&indices);
-        match unsafe { swfn.queue_present(gpu.queue, &present) } {
+        let t_present = Instant::now();
+        let presented = unsafe { swfn.queue_present(gpu.queue, &present) };
+        log::trace!(
+            "frame {frame_no} zoom {:.4} pointer {:?} quads {nquads}: acquire {acquire_ms:.1} ms, \
+             submitted at {submitted_ms:.1} ms, present {:.1} ms",
+            self.zoom.current(),
+            self.pointer,
+            t_present.elapsed().as_secs_f64() * 1e3
+        );
+        match presented {
             Ok(false) => {}
             Ok(true) | Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => self.recreate_swapchain()?,
             Err(e) => return Err(e).context("vkQueuePresentKHR"),
