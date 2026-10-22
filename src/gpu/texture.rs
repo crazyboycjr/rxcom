@@ -74,22 +74,10 @@ impl Gpu {
             .map(|m| m.drm_format_modifier_tiling_features)
     }
 
-    /// Wraps a pixmap's dma-buf in a sampled image without copying. The fd is
-    /// consumed whether or not the import succeeds.
-    pub fn import_dmabuf(&self, buf: DmaBuf) -> Result<Texture> {
-        let mem_fd = self.mem_fd.as_ref().ok_or_else(|| anyhow!("device cannot import dma-bufs"))?;
-        if buf.bpp != 32 || !(buf.depth == 24 || buf.depth == 32) {
-            bail!("unsupported pixmap format: depth {} bpp {}", buf.depth, buf.bpp);
-        }
-        let feats = self
-            .modifier_features(buf.modifier)
-            .ok_or_else(|| anyhow!("modifier 0x{:016x} not supported for sampling", buf.modifier))?;
-        if !feats.contains(vk::FormatFeatureFlags::SAMPLED_IMAGE) {
-            bail!("modifier 0x{:016x} cannot be sampled", buf.modifier);
-        }
-        let dev = &self.device;
+    /// The image's plane offset stays 0: the pixmap's offset goes into the bind.
+    fn dmabuf_image(&self, buf: &DmaBuf) -> Result<vk::Image> {
         let plane = [vk::SubresourceLayout {
-            offset: buf.offset as u64,
+            offset: 0,
             size: 0,
             row_pitch: buf.stride as u64,
             array_pitch: 0,
@@ -108,20 +96,40 @@ impl Gpu {
             .array_layers(1)
             .samples(vk::SampleCountFlags::TYPE_1)
             .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
-            .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC)
+            .usage(vk::ImageUsageFlags::SAMPLED)
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .initial_layout(vk::ImageLayout::UNDEFINED)
             .push_next(&mut ext)
             .push_next(&mut modinfo);
-        let image = unsafe { dev.create_image(&info, None) }.context("vkCreateImage for dma-buf")?;
+        Ok(unsafe { self.device.create_image(&info, None) }.context("vkCreateImage for a dma-buf")?)
+    }
 
+    /// Wraps a pixmap's dma-buf in a sampled image without copying.
+    ///
+    /// The X driver suballocates pixmaps: each export names the whole buffer
+    /// object (close to 1 GB on NVIDIA) plus the pixmap's offset in it. NVIDIA
+    /// mishandles a non-zero plane offset in the modifier layout (wrong pixels,
+    /// and VA-space assertions in the kernel log), so the offset goes into the
+    /// memory bind instead, which the spec treats as equivalent.
+    pub fn import_dmabuf(&self, buf: DmaBuf) -> Result<Texture> {
+        let mem_fd = self.mem_fd.as_ref().ok_or_else(|| anyhow!("device cannot import dma-bufs"))?;
+        if buf.bpp != 32 || !(buf.depth == 24 || buf.depth == 32) {
+            bail!("unsupported pixmap format: depth {} bpp {}", buf.depth, buf.bpp);
+        }
+        let feats = self
+            .modifier_features(buf.modifier)
+            .ok_or_else(|| anyhow!("modifier 0x{:016x} not supported for sampling", buf.modifier))?;
+        if !feats.contains(vk::FormatFeatureFlags::SAMPLED_IMAGE) {
+            bail!("modifier 0x{:016x} cannot be sampled", buf.modifier);
+        }
+        let dev = &self.device;
+        let image = self.dmabuf_image(&buf)?;
         let result = (|| -> Result<Texture> {
-            let mut dedicated = vk::MemoryDedicatedRequirements::default();
-            let mut req2 = vk::MemoryRequirements2::default().push_next(&mut dedicated);
-            unsafe {
-                dev.get_image_memory_requirements2(&vk::ImageMemoryRequirementsInfo2::default().image(image), &mut req2)
-            };
-            let req = req2.memory_requirements;
+            let req = unsafe { dev.get_image_memory_requirements(image) };
+            let offset = buf.offset as u64;
+            if offset % req.alignment != 0 {
+                bail!("pixmap offset {offset} breaks the image alignment {}", req.alignment);
+            }
             let mut fd_props = vk::MemoryFdPropertiesKHR::default();
             unsafe {
                 mem_fd.get_memory_fd_properties(
@@ -131,38 +139,27 @@ impl Gpu {
                 )
             }
             .context("vkGetMemoryFdPropertiesKHR")?;
-            let bits = req.memory_type_bits & fd_props.memory_type_bits;
             let ty = self
-                .memory_type(bits, vk::MemoryPropertyFlags::empty())
+                .memory_type(req.memory_type_bits & fd_props.memory_type_bits, vk::MemoryPropertyFlags::empty())
                 .ok_or_else(|| anyhow!("no memory type fits the dma-buf"))?;
-            // The fd names the whole buffer object; its size bounds the import.
             let fd_size = unsafe { libc::lseek(buf.fd.as_raw_fd(), 0, libc::SEEK_END) };
-            let size = if fd_size > 0 { (fd_size as u64).max(req.size) } else { req.size };
+            let size = (fd_size.max(0) as u64).max(offset + req.size);
             let mut import = vk::ImportMemoryFdInfoKHR::default()
                 .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
                 .fd(buf.fd.as_raw_fd());
-            let mut ded = vk::MemoryDedicatedAllocateInfo::default().image(image);
-            let mut alloc = vk::MemoryAllocateInfo::default()
-                .allocation_size(size)
-                .memory_type_index(ty)
-                .push_next(&mut import);
-            if dedicated.requires_dedicated_allocation != 0 || dedicated.prefers_dedicated_allocation != 0 {
-                alloc = alloc.push_next(&mut ded);
-            }
+            let alloc = vk::MemoryAllocateInfo::default().allocation_size(size).memory_type_index(ty).push_next(&mut import);
+            let start = std::time::Instant::now();
             let memory = unsafe { dev.allocate_memory(&alloc, None) }.context("vkAllocateMemory (dma-buf import)")?;
             // Vulkan owns the fd once the import succeeded.
             let _ = buf.fd.into_raw_fd();
-            if let Err(e) = unsafe { dev.bind_image_memory(image, memory, 0) } {
-                unsafe { dev.free_memory(memory, None) };
-                return Err(e).context("vkBindImageMemory (dma-buf)");
-            }
-            let view = match view_for(self, image, PIXMAP_FORMAT, buf.depth == 24) {
-                Ok(v) => v,
-                Err(e) => {
-                    unsafe { dev.free_memory(memory, None) };
-                    return Err(e);
-                }
-            };
+            log::debug!(
+                "imported a {size}-byte dma-buf at offset {offset} in {:.1} ms",
+                start.elapsed().as_secs_f64() * 1e3
+            );
+            let view = unsafe { dev.bind_image_memory(image, memory, offset) }
+                .context("vkBindImageMemory (dma-buf)")
+                .and_then(|_| view_for(self, image, PIXMAP_FORMAT, buf.depth == 24))
+                .inspect_err(|_| unsafe { dev.free_memory(memory, None) })?;
             Ok(Texture {
                 image,
                 memory,
@@ -305,3 +302,4 @@ impl Gpu {
         );
     }
 }
+
