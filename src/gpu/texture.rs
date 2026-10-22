@@ -69,6 +69,16 @@ impl Gpu {
         let mut list = vk::DrmFormatModifierPropertiesListEXT::default().drm_format_modifier_properties(&mut mods);
         let mut props = vk::FormatProperties2::default().push_next(&mut list);
         unsafe { self.instance.get_physical_device_format_properties2(self.pdev, PIXMAP_FORMAT, &mut props) };
+        if log::log_enabled!(log::Level::Trace) {
+            for m in &mods {
+                log::trace!(
+                    "modifier 0x{:016x}: {} plane(s), {:?}",
+                    m.drm_format_modifier,
+                    m.drm_format_modifier_plane_count,
+                    m.drm_format_modifier_tiling_features
+                );
+            }
+        }
         mods.iter()
             .find(|m| m.drm_format_modifier == modifier && m.drm_format_modifier_plane_count == 1)
             .map(|m| m.drm_format_modifier_tiling_features)

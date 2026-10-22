@@ -461,8 +461,10 @@ impl Compositor {
                 Ok(t) => return Ok((t, Source::DmaBuf)),
                 Err(e) => {
                     if !self.warned_dri3 {
-                        log::warn!("DRI3 import failed, copying through MIT-SHM instead: {e:#}");
+                        log::warn!("DRI3 import of pixmap 0x{pixmap:x} failed, copying through MIT-SHM instead: {e:#}");
                         self.warned_dri3 = true;
+                    } else {
+                        log::debug!("DRI3 import of pixmap 0x{pixmap:x} failed: {e:#}");
                     }
                 }
             }

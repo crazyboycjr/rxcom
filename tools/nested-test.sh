@@ -5,6 +5,9 @@
 #
 #   CARGO_TARGET_DIR=... tools/nested-test.sh [display number, default 23]
 #
+# With RXCOM_TEST_EXTERNAL=1 the display must already be running (for example
+# tools/xwayland.sh) and is left running.
+#
 # Build first: cargo build --all-targets. Screenshots and logs go to
 # $RXCOM_SCRATCH/shots/run (default ~/.cache/claude-scratch/rxcom). Vulkan
 # runs on the NVIDIA driver unless VK_DRIVER_FILES says otherwise; the real
@@ -27,14 +30,15 @@ check() {
 shot() { import -window root "$out/$1.png"; }
 pids=()
 rx=
+external=${RXCOM_TEST_EXTERNAL:-}
 cleanup() {
 	[ -n "$rx" ] && kill "$rx" 2>/dev/null
 	kill "${pids[@]}" 2>/dev/null
-	"$here/nested.sh" stop "$n" >/dev/null
+	[ -n "$external" ] || "$here/nested.sh" stop "$n" >/dev/null
 }
 trap cleanup EXIT
 
-"$here/nested.sh" start "$n" || exit 1
+[ -n "$external" ] || "$here/nested.sh" start "$n" || exit 1
 magick -size 1920x1080 gradient:'#203050'-'#a07040' -fill white -draw 'circle 960,540 960,700' \
 	"$out/wallpaper.png"
 feh --no-fehbg --bg-tile "$out/wallpaper.png"
@@ -172,8 +176,11 @@ echo "   exited with status $status after $((($(date +%s%N) - start) / 1000000))
 check grep -q "released the screen" "$out/rxcom3.log"
 
 echo "7. no Vulkan validation messages, warnings or errors in the log"
-grep -E "vulkan:|WARN|ERROR" "$out/rxcom.log" | head -5
-check test -z "$(grep -E 'vulkan:|WARN|ERROR' "$out/rxcom.log")"
+# A pixmap the server cannot export (Xwayland's root pixmap, compressed modifiers)
+# falls back to MIT-SHM copies with one warning; that is handled, not a failure.
+problems=$(grep -E 'vulkan:|WARN|ERROR' "$out/rxcom.log" | grep -v 'DRI3 import of pixmap')
+echo "$problems" | head -5
+check test -z "$problems"
 
 echo
 if [ "$fails" -eq 0 ]; then echo "all checks passed"; else echo "$fails checks FAILED"; fi
