@@ -6,7 +6,7 @@ proposal for the full version.
 
 ## Build
 
-Needs Rust 1.85 or newer, libxcb, a Vulkan 1.3 driver with
+Needs Rust 1.88 or newer, libxcb, a Vulkan 1.3 driver with
 VK_KHR_push_descriptor, and `glslc` (Arch package `shaderc`).
 
     cargo build --release
