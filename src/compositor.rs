@@ -89,6 +89,13 @@ pub struct Compositor {
     warned_dri3: bool,
 }
 
+/// Reads one signal from the non-blocking signalfd, if any arrived.
+fn pending_signal(sigfd: RawFd) -> Option<u32> {
+    let mut info = [0u8; std::mem::size_of::<libc::signalfd_siginfo>()];
+    let n = unsafe { libc::read(sigfd, info.as_mut_ptr().cast(), info.len()) };
+    (n == info.len() as isize).then(|| u32::from_ne_bytes(info[..4].try_into().unwrap()))
+}
+
 fn geometry(g: &GetGeometryReply) -> Geometry {
     Geometry { x: g.x, y: g.y, width: g.width, height: g.height, border: g.border_width }
 }
@@ -771,6 +778,12 @@ impl Compositor {
     pub fn run(&mut self, sigfd: RawFd) -> Result<()> {
         let xfd = self.x.conn.as_raw_fd();
         loop {
+            // Checked every iteration: under continuous rendering the loop may
+            // not reach poll() for a long time.
+            if let Some(signo) = pending_signal(sigfd) {
+                log::info!("signal {signo}, shutting down");
+                return Ok(());
+            }
             while let Some(ev) = self.x.conn.poll_for_event()? {
                 self.handle(ev)?;
             }
@@ -813,13 +826,6 @@ impl Compositor {
                 if e.kind() != std::io::ErrorKind::Interrupted {
                     return Err(e).context("poll");
                 }
-            }
-            if fds[1].revents != 0 {
-                let mut info = [0u8; 128];
-                unsafe { libc::read(sigfd, info.as_mut_ptr().cast(), info.len()) };
-                let signo = u32::from_ne_bytes(info[..4].try_into().unwrap());
-                log::info!("signal {signo}, shutting down");
-                return Ok(());
             }
         }
     }

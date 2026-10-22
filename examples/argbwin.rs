@@ -3,6 +3,7 @@
 //!
 //!   argbwin [--geometry WxH+X+Y] [--depth 32|24] [--color AARRGGBB]
 //!           [--pattern solid|gradient|quadrants] [--animate] [--name NAME]
+//!           [--override-redirect]
 //!
 //! Colours are premultiplied ARGB. `gradient` ramps alpha from 0 at the left to
 //! the colour's alpha at the right; `quadrants` paints four opaque colours;
@@ -28,6 +29,7 @@ struct Args {
     pattern: String,
     animate: bool,
     name: String,
+    override_redirect: bool,
 }
 
 fn parse() -> Result<Args> {
@@ -41,6 +43,7 @@ fn parse() -> Result<Args> {
         pattern: "solid".into(),
         animate: false,
         name: "argbwin".into(),
+        override_redirect: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
@@ -58,6 +61,7 @@ fn parse() -> Result<Args> {
             "--pattern" => a.pattern = v()?,
             "--animate" => a.animate = true,
             "--name" => a.name = v()?,
+            "--override-redirect" => a.override_redirect = true,
             _ => bail!("unknown option {k}"),
         }
     }
@@ -115,6 +119,7 @@ fn main() -> Result<()> {
             .background_pixel(0)
             .border_pixel(0)
             .colormap(cmap)
+            .override_redirect(a.override_redirect as u32)
             .event_mask(EventMask::EXPOSURE | EventMask::STRUCTURE_NOTIFY),
     )?;
     conn.change_property8(PropMode::REPLACE, win, AtomEnum::WM_NAME, AtomEnum::STRING, a.name.as_bytes())?;
