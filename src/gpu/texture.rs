@@ -111,7 +111,7 @@ impl Gpu {
             .initial_layout(vk::ImageLayout::UNDEFINED)
             .push_next(&mut ext)
             .push_next(&mut modinfo);
-        Ok(unsafe { self.device.create_image(&info, None) }.context("vkCreateImage for a dma-buf")?)
+        unsafe { self.device.create_image(&info, None) }.context("vkCreateImage for a dma-buf")
     }
 
     /// Wraps a pixmap's dma-buf in a sampled image without copying.
@@ -137,7 +137,7 @@ impl Gpu {
         let result = (|| -> Result<Texture> {
             let req = unsafe { dev.get_image_memory_requirements(image) };
             let offset = buf.offset as u64;
-            if offset % req.alignment != 0 {
+            if !offset.is_multiple_of(req.alignment) {
                 bail!("pixmap offset {offset} breaks the image alignment {}", req.alignment);
             }
             let mut fd_props = vk::MemoryFdPropertiesKHR::default();

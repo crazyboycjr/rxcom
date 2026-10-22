@@ -40,11 +40,10 @@ pub fn init(verbosity: u8) {
         1 => LevelFilter::Debug,
         _ => LevelFilter::Trace,
     };
-    if let Ok(v) = std::env::var("RXCOM_LOG") {
-        if let Ok(l) = v.parse() {
+    if let Ok(v) = std::env::var("RXCOM_LOG")
+        && let Ok(l) = v.parse() {
             level = l;
         }
-    }
     let logger = LOGGER.get_or_init(|| Logger { start: Instant::now() });
     if log::set_logger(logger).is_ok() {
         log::set_max_level(level);

@@ -62,9 +62,10 @@ struct Background {
 
 pub struct Compositor {
     x: X,
-    /// The libxcb connection the Vulkan surface presents through. A separate one,
-    /// so the driver's presentation traffic never interleaves with our events.
-    wsi: XCBConnection,
+    /// The libxcb connection the Vulkan surface presents through, kept open for
+    /// the surface's lifetime. A separate one, so the driver's presentation
+    /// traffic never interleaves with our events.
+    _wsi: XCBConnection,
     gpu: ManuallyDrop<Gpu>,
     renderer: Renderer,
     swapchain: Option<Swapchain>,
@@ -106,7 +107,8 @@ impl Compositor {
         x.become_compositor()?;
         let mut c = match Self::with_x(x, opts) {
             Ok(c) => c,
-            Err((mut x, e)) => {
+            Err(failed) => {
+                let (mut x, e) = *failed;
                 x.release_compositor();
                 return Err(e);
             }
@@ -116,7 +118,9 @@ impl Compositor {
         Ok(c)
     }
 
-    fn with_x(x: X, opts: &Options) -> std::result::Result<Compositor, (X, anyhow::Error)> {
+    /// Builds everything after the X setup; on failure hands the X state back so
+    /// the caller can undo it.
+    fn with_x(x: X, opts: &Options) -> std::result::Result<Compositor, Box<(X, anyhow::Error)>> {
         let setup = (|| -> Result<_> {
             let name = opts.display.as_deref().map(CString::new).transpose()?;
             let (wsi, _) = XCBConnection::connect(name.as_deref()).context("second X connection for Vulkan")?;
@@ -131,7 +135,7 @@ impl Compositor {
         })();
         let (wsi, gpu) = match setup {
             Ok(v) => v,
-            Err(e) => return Err((x, e)),
+            Err(e) => return Err(Box::new((x, e))),
         };
         let use_dri3 = opts.dri3 && x.features.dri3 && gpu.mem_fd.is_some();
         let gpu = ManuallyDrop::new(gpu);
@@ -162,7 +166,7 @@ impl Compositor {
             Ok(v) => v,
             Err(e) => {
                 ManuallyDrop::into_inner(gpu);
-                return Err((x, e));
+                return Err(Box::new((x, e)));
             }
         };
         let fence = if use_dri3 && opts.sync_fence && x.features.sync {
@@ -178,7 +182,7 @@ impl Compositor {
         let reader = ImageReader::new(x.features.shm_fd);
         Ok(Compositor {
             x,
-            wsi,
+            _wsi: wsi,
             gpu,
             renderer,
             swapchain: Some(swapchain),
@@ -412,12 +416,11 @@ impl Compositor {
     fn refresh_background(&mut self) {
         self.dirty = true;
         let pixmap = self.x.root_pixmap();
-        if let (Some(bg), Some(p)) = (self.background.as_mut(), pixmap) {
-            if bg.pixmap == p {
+        if let (Some(bg), Some(p)) = (self.background.as_mut(), pixmap)
+            && bg.pixmap == p {
                 bg.dirty = bg.source == Source::Shm;
                 return;
             }
-        }
         if let Some(bg) = self.background.take() {
             self.defer(Garbage::Texture(bg.tex));
         }
@@ -511,17 +514,15 @@ impl Compositor {
     fn gather_uploads(&mut self, slot: usize) -> Result<Vec<(Option<Window>, u64)>> {
         let align = |n: u64| (n + 255) & !255;
         let mut jobs: Vec<(Option<Window>, u32, u32, u32)> = Vec::new();
-        if let Some(bg) = &self.background {
-            if bg.dirty {
+        if let Some(bg) = &self.background
+            && bg.dirty {
                 jobs.push((None, bg.pixmap, bg.tex.width, bg.tex.height));
             }
-        }
         for w in self.wins.iter() {
-            if w.drawable() && w.content_dirty && w.source == Some(Source::Shm) {
-                if let (Some(p), Some(t)) = (w.pixmap, &w.tex) {
+            if w.drawable() && w.content_dirty && w.source == Some(Source::Shm)
+                && let (Some(p), Some(t)) = (w.pixmap, &w.tex) {
                     jobs.push((Some(w.id), p, t.width, t.height));
                 }
-            }
         }
         if jobs.is_empty() {
             return Ok(Vec::new());
@@ -568,11 +569,10 @@ impl Compositor {
         let now = Instant::now();
         self.zoom.advance(now);
         let zoomed = self.zoom.active();
-        if zoomed {
-            if let Some(p) = self.x.pointer() {
+        if zoomed
+            && let Some(p) = self.x.pointer() {
                 self.pointer = p;
             }
-        }
 
         let slot = (self.frame_no % FRAMES as u64) as usize;
         let fence = self.frames[slot].fence;
@@ -795,12 +795,11 @@ impl Compositor {
             let now = Instant::now();
             let mut timeout: Option<Duration> = None;
             if self.zoom.active() {
-                if let Some(p) = self.x.pointer() {
-                    if p != self.pointer {
+                if let Some(p) = self.x.pointer()
+                    && p != self.pointer {
                         self.pointer = p;
                         self.dirty = true;
                     }
-                }
                 timeout = Some(POINTER_POLL);
             }
             if self.zoom.animating() {
@@ -881,7 +880,6 @@ impl Compositor {
             use x11rb::protocol::sync::ConnectionExt as _;
             let _ = self.x.conn.sync_destroy_fence(f).map(|c| c.ignore_error());
         }
-        let _ = &self.wsi;
     }
 }
 

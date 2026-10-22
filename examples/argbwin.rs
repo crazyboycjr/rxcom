@@ -139,11 +139,10 @@ fn main() -> Result<()> {
             for y in y0..y0 + rows {
                 for x in 0..w {
                     let mut p = pixel(&a, size, x as u32, y as u32);
-                    if let Some(b) = bar {
-                        if x >= b && x < b + 20 {
+                    if let Some(b) = bar
+                        && x >= b && x < b + 20 {
                             p = 0xff000000 | 0x00ffff00;
                         }
-                    }
                     data.extend_from_slice(&p.to_le_bytes());
                 }
             }

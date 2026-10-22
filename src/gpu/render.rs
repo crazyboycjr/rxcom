@@ -296,6 +296,7 @@ impl Renderer {
 
     /// Fills the target with the scene magnified by `zoom` around `origin`; the
     /// scene must be in SHADER_READ_ONLY_OPTIMAL layout.
+    #[allow(clippy::too_many_arguments)]
     pub fn record_zoom(
         &self,
         gpu: &Gpu,

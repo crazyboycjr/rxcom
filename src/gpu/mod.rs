@@ -141,11 +141,10 @@ impl Gpu {
                 log::debug!("skipping {name}: Vulkan 1.3 needed");
                 continue;
             }
-            if let Some(f) = opts.device_filter {
-                if !name.to_lowercase().contains(&f.to_lowercase()) {
+            if let Some(f) = opts.device_filter
+                && !name.to_lowercase().contains(&f.to_lowercase()) {
                     continue;
                 }
-            }
             let exts = unsafe { instance.enumerate_device_extension_properties(pd)? };
             if !has_ext(&exts, ash::khr::push_descriptor::NAME) {
                 log::debug!("skipping {name}: no VK_KHR_push_descriptor");
