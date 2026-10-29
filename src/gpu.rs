@@ -654,6 +654,9 @@ impl Gpu {
                 }
                 self.swapchain_fn.destroy_swapchain(sc.handle, None);
             }
+            for s in &mut self.slots {
+                s.present_at = None;
+            }
             // An acquired image's semaphore stays signalled; replace it.
             if let Some((_, slot)) = self.acquired.take()
                 && let Ok(s) = d.create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
@@ -663,7 +666,6 @@ impl Gpu {
         }
     }
 
-    /// Whether the GPU has finished reading the scene, so X may draw into it.
     /// Logs presents the presentation engine holds longer than PRESENT_LIMIT,
     /// and when it lets them go. Returns when to look again.
     pub fn check_presents(&mut self, now: std::time::Instant) -> Option<std::time::Duration> {
@@ -688,6 +690,7 @@ impl Gpu {
         next
     }
 
+    /// Whether the GPU has finished reading the scene, so X may draw into it.
     pub fn scene_free(&self) -> Result<bool> {
         Ok(unsafe { self.device.get_semaphore_counter_value(self.timeline)? } >= self.frame)
     }

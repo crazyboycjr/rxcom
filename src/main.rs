@@ -65,7 +65,9 @@ fn parse_args() -> Result<(Options, u8)> {
             "--max-fps" => o.max_fps = Some(value()?.parse().context("--max-fps")?),
             "--present-mode" => {
                 let m = value()?;
-                o.present_mode = Some(rxcom::gpu::present_mode(&m).with_context(|| format!("--present-mode {m}"))?);
+                let mode = rxcom::gpu::present_mode(&m);
+                o.present_mode =
+                    Some(mode.with_context(|| format!("--present-mode {m}: not latest, fifo, relaxed or immediate"))?);
             }
             "--background" => {
                 let v = value()?;
