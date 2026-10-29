@@ -655,6 +655,7 @@ impl Gpu {
             Ok((image, _)) => self.acquired = Some((image, slot)),
             Err(vk::Result::NOT_READY | vk::Result::TIMEOUT) => return Ok(false),
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                log::info!("swapchain out of date at acquire");
                 self.drop_swapchain();
                 return Ok(false);
             }
@@ -740,7 +741,10 @@ impl Gpu {
             }
             match self.swapchain_fn.queue_present(self.queue, &present) {
                 Ok(false) => {}
-                Ok(true) | Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => self.drop_swapchain(),
+                Ok(true) | Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                    log::info!("swapchain suboptimal or out of date at present");
+                    self.drop_swapchain();
+                }
                 Err(e) => return Err(e).context("vkQueuePresentKHR"),
             }
         }
