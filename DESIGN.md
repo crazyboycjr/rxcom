@@ -34,8 +34,8 @@ Depth-32 windows blend as premultiplied alpha. Depth-24 windows are opaque: thei
 undefined top byte is replaced by one through the image view's swizzle. The
 background is the pixmap named by `_XROOTPMAP_ID` or `ESETROOT_PMAP_ID`, tiled,
 or a solid colour. Frames are presented through a FIFO swapchain on the overlay
-window. Zoom follows the root property `_PICOM_ZOOM`, the same protocol the
-patched picom uses (section 1.5). On SIGINT, SIGTERM or SIGHUP rxcom tears down
+window. Zoom follows the root property `_SCREEN_ZOOM`, the patched picom's
+protocol under a neutral name since 10-29 (section 1.5). On SIGINT, SIGTERM or SIGHUP rxcom tears down
 the GPU side, unredirects, releases the overlay and the selection, and leaves the
 screen as it found it.
 
@@ -132,8 +132,9 @@ traffic never interleaves with rxcom's event stream.
 
 ### 1.5 Zoom
 
-The window manager writes the target zoom to the root property `_PICOM_ZOOM`
-(CARDINAL, format 32, one value in 16.16 fixed point). A missing property, or a
+The window manager writes the target zoom to the root property `_SCREEN_ZOOM`
+(picom-zoom's `_PICOM_ZOOM` until 10-29; CARDINAL, format 32, one value in 16.16
+fixed point). A missing property, or a
 value of at most 65536, means no zoom. Values are clamped to 1.0 to 16.0. The
 current zoom eases exponentially toward the target with a 50 ms time constant
 and snaps when within 0.001. The clock starts when the target changes, so a long

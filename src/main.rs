@@ -20,10 +20,10 @@ usage: rxcom [options]
   -v, -vv                 more logging (or RXCOM_LOG=debug)
   -h, --help
 
-Zoom: the window manager sets the root property _PICOM_ZOOM (CARDINAL/32,
-16.16 fixed point), as for picom-zoom; for example 2x, then off:
-  xprop -root -f _PICOM_ZOOM 32c -set _PICOM_ZOOM 131072
-  xprop -root -remove _PICOM_ZOOM
+Zoom: the window manager sets the root property _SCREEN_ZOOM (CARDINAL/32,
+16.16 fixed point), as for xcompmgr-zoom; for example 2x, then off:
+  xprop -root -f _SCREEN_ZOOM 32c -set _SCREEN_ZOOM 131072
+  xprop -root -remove _SCREEN_ZOOM
 ";
 
 /// Stops rxcom if one turn of its loop is stuck for longer than this.

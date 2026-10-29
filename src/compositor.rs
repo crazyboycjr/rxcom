@@ -169,7 +169,7 @@ impl Compositor {
             }
         };
         let now = Instant::now();
-        let zoom = Zoom::new(x.root_cardinal(x.atoms.picom_zoom, AtomEnum::CARDINAL), now);
+        let zoom = Zoom::new(x.root_cardinal(x.atoms.screen_zoom, AtomEnum::CARDINAL), now);
         let min_interval = frame_interval(&x, opts.max_fps);
         let mut c = Compositor {
             vt: x.vt().and_then(Vt::open),
@@ -373,7 +373,7 @@ impl Compositor {
             Event::XinputRawMotion(_) => self.pointer_moved = true,
             Event::PropertyNotify(e) if e.window == root => {
                 let a = &self.x.atoms;
-                if e.atom == a.picom_zoom {
+                if e.atom == a.screen_zoom {
                     let v = (e.state != Property::DELETE).then(|| self.x.root_cardinal(e.atom, AtomEnum::CARDINAL));
                     let z = Zoom::from_property(v.flatten());
                     log::debug!("zoom target {z:.3}");

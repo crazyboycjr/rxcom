@@ -71,8 +71,8 @@ for step in $(seq "$steps"); do
 	6) xdotool windowunmap "$w" 2>/dev/null ;;
 	7) for u in $(xdotool search --onlyvisible=0 --name '^[sa][0-9]+$' 2>/dev/null); do xdotool windowmap "$u" 2>/dev/null; done ;;
 	8) kill "$(xdotool getwindowpid "$w" 2>/dev/null)" 2>/dev/null; spawn $((100 + step)) ;;
-	9) xprop -root -f _PICOM_ZOOM 32c -set _PICOM_ZOOM $((65536 + RANDOM * 8)); xdotool mousemove $((RANDOM % 1920)) $((RANDOM % 1080)) ;;
-	10) xprop -root -remove _PICOM_ZOOM ;;
+	9) xprop -root -f _SCREEN_ZOOM 32c -set _SCREEN_ZOOM $((65536 + RANDOM * 8)); xdotool mousemove $((RANDOM % 1920)) $((RANDOM % 1080)) ;;
+	10) xprop -root -remove _SCREEN_ZOOM ;;
 	11) feh --no-fehbg --bg-tile "$out/wall$((1 + RANDOM % 2)).png" ;;
 	esac
 	sleep 0.0$((RANDOM % 6))
@@ -84,7 +84,7 @@ for step in $(seq "$steps"); do
 done
 
 echo "settling: unzoom, map everything, stop animations and ARGB clients"
-xprop -root -remove _PICOM_ZOOM
+xprop -root -remove _SCREEN_ZOOM
 for u in $(xdotool search --name '^[sa][0-9]+$' 2>/dev/null); do xdotool windowmap "$u" 2>/dev/null; done
 for p in $(pgrep -x argbwin); do
 	if tr '\0' ' ' </proc/"$p"/cmdline | grep -qE -- '--animate|--depth 32'; then kill "$p"; fi

@@ -26,7 +26,7 @@ pub struct Atoms {
     pub cm_selection: u32,
     pub xrootpmap_id: u32,
     pub esetroot_pmap_id: u32,
-    pub picom_zoom: u32,
+    pub screen_zoom: u32,
     pub xfree86_vt: u32,
 }
 
@@ -121,7 +121,7 @@ impl X {
             cm_selection: intern(&conn, &format!("_NET_WM_CM_S{screen}"))?,
             xrootpmap_id: intern(&conn, "_XROOTPMAP_ID")?,
             esetroot_pmap_id: intern(&conn, "ESETROOT_PMAP_ID")?,
-            picom_zoom: intern(&conn, "_PICOM_ZOOM")?,
+            screen_zoom: intern(&conn, "_SCREEN_ZOOM")?,
             xfree86_vt: intern(&conn, "XFree86_VT")?,
         };
         Ok(X {

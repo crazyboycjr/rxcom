@@ -1,5 +1,5 @@
 //! Desktop zoom, following picom-zoom exactly so both compositors agree: the
-//! target comes from the root property _PICOM_ZOOM (16.16 fixed point), the
+//! target comes from the root property _SCREEN_ZOOM (16.16 fixed point), the
 //! level eases toward it in log space, and the view keeps the centre of the
 //! pixel under the pointer in place, so input needs no transform.
 

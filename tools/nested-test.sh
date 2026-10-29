@@ -83,7 +83,7 @@ echo "3. zoom 2x and 4x around the pointer, then back (nearest, pixel-exact)"
 xdotool mousemove 400 330
 sleep 0.3
 shot zoom1
-xprop -root -f _PICOM_ZOOM 32c -set _PICOM_ZOOM 131072
+xprop -root -f _SCREEN_ZOOM 32c -set _SCREEN_ZOOM 131072
 sleep 1
 shot zoom2x
 check python3 "$here/zoomcheck.py" "$out/zoom1.png" "$out/zoom2x.png" 2 400 330
@@ -91,23 +91,23 @@ xdotool mousemove 1290 125
 sleep 0.5
 shot zoom2x_moved
 check python3 "$here/zoomcheck.py" "$out/zoom1.png" "$out/zoom2x_moved.png" 2 1290 125
-xprop -root -f _PICOM_ZOOM 32c -set _PICOM_ZOOM 262144
+xprop -root -f _SCREEN_ZOOM 32c -set _SCREEN_ZOOM 262144
 sleep 1
 shot zoom4x
 check python3 "$here/zoomcheck.py" "$out/zoom1.png" "$out/zoom4x.png" 4 1290 125
 echo "   16x at the screen's corner (the property asks for 30518x, clamped to 16x):"
 xdotool mousemove 1919 0
-xprop -root -f _PICOM_ZOOM 32c -set _PICOM_ZOOM 2000000000
+xprop -root -f _SCREEN_ZOOM 32c -set _SCREEN_ZOOM 2000000000
 sleep 1.5
 shot zoom16x
 check python3 "$here/zoomcheck.py" "$out/zoom1.png" "$out/zoom16x.png" 16 1919 0
 echo "   2.5x, between whole pixels:"
 xdotool mousemove 300 250
-xprop -root -f _PICOM_ZOOM 32c -set _PICOM_ZOOM 163840
+xprop -root -f _SCREEN_ZOOM 32c -set _SCREEN_ZOOM 163840
 sleep 1
 shot zoom2_5x
 check python3 "$here/zoomcheck.py" "$out/zoom1.png" "$out/zoom2_5x.png" 2.5 300 250
-xprop -root -remove _PICOM_ZOOM
+xprop -root -remove _SCREEN_ZOOM
 sleep 1
 shot unzoomed
 check python3 "$here/compare.py" "$out/zoom1.png" "$out/unzoomed.png"
@@ -192,10 +192,10 @@ sleep 0.4
 shot fs2
 check bar_moved "$out/fs1.png" "$out/fs2.png" 540
 echo "   zooming composites again, and the screen goes back to the window after the zoom:"
-xprop -root -f _PICOM_ZOOM 32c -set _PICOM_ZOOM 131072
+xprop -root -f _SCREEN_ZOOM 32c -set _SCREEN_ZOOM 131072
 sleep 0.5
 check test "$(grep -c "compositing again" "$out/rxcom.log")" -eq 1
-xprop -root -remove _PICOM_ZOOM
+xprop -root -remove _SCREEN_ZOOM
 sleep 1
 check test "$(grep -c "unredirecting the screen" "$out/rxcom.log")" -eq 2
 "$bin/examples/argbwin" --geometry 300x200+100+100 --depth 24 --color ffc08000 --override-redirect --name popup &
@@ -234,11 +234,11 @@ xdotool mousemove 700 400
 rx=$!
 sleep 1.5
 shot unzoomed2
-xprop -root -f _PICOM_ZOOM 32c -set _PICOM_ZOOM 196608
+xprop -root -f _SCREEN_ZOOM 32c -set _SCREEN_ZOOM 196608
 sleep 1
 shot zoom3x_linear
 check python3 "$here/zoomcheck.py" "$out/unzoomed2.png" "$out/zoom3x_linear.png" 3 700 400 linear
-xprop -root -remove _PICOM_ZOOM
+xprop -root -remove _SCREEN_ZOOM
 sleep 0.5
 kill -TERM "$rx"
 wait "$rx"
@@ -268,7 +268,7 @@ if [ -z "$external" ]; then
 	sleep 1.5
 	shot before_hang
 	# Zoomed, rxcom asks for the pointer every 4 ms, so it is soon waiting on X.
-	xprop -root -f _PICOM_ZOOM 32c -set _PICOM_ZOOM 131072
+	xprop -root -f _SCREEN_ZOOM 32c -set _SCREEN_ZOOM 131072
 	sleep 0.5
 	xpid=$(cat "$scratch/xvfb$n.pid")
 	kill -STOP "$xpid"
@@ -277,7 +277,7 @@ if [ -z "$external" ]; then
 	sleep 0.5
 	check kill -0 "$rx"
 	check grep -q "the X server has not answered for" "$out/rxcom4.log"
-	xprop -root -remove _PICOM_ZOOM
+	xprop -root -remove _SCREEN_ZOOM
 	sleep 1
 	shot after_hang
 	check python3 "$here/compare.py" "$out/before_hang.png" "$out/after_hang.png" --ignore 1100,300,500,160

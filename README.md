@@ -20,11 +20,17 @@ screen back on SIGINT or SIGTERM.
 
     rxcom [-v]           # rxcom --help lists the options
 
-Zoom through the root property shared with picom-zoom (16.16 fixed point;
-65536 or less, or no property, means no zoom):
+Zoom through the root property `_SCREEN_ZOOM`, which xcompmgr-zoom reads too:
 
-    xprop -root -f _PICOM_ZOOM 32c -set _PICOM_ZOOM 131072   # 2x
-    xprop -root -remove _PICOM_ZOOM
+    xprop -root -f _SCREEN_ZOOM 32c -set _SCREEN_ZOOM 131072   # 2x
+    xprop -root -remove _SCREEN_ZOOM
+
+The property is CARDINAL, format 32, one value on each screen's root window:
+the target magnification of that screen in 16.16 fixed point. No property, or a
+value of 65536 or less, means no zoom, and values above 16x are clamped. The
+compositor eases toward the target (40 ms time constant in log space), keeps the
+centre of the pixel under the pointer in place, so input needs no transform, and
+leaves the cursor unmagnified. A window manager or any other client sets it.
 
 ## Test
 
