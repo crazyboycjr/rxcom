@@ -1,7 +1,7 @@
-//! Aborts rxcom when one turn of its loop takes far too long: a spin, or a call
-//! into a driver that never returns. The X server undoes the redirection when
-//! rxcom's connection closes, so the desktop stays usable, uncomposited,
-//! instead of frozen on the last frame.
+//! Restarts rxcom when one turn of its loop takes far too long: a spin, or a
+//! call into a driver that never returns. The stuck process aborts, and the X
+//! server undoes its redirection when the connection closes, so the desktop is
+//! usable meanwhile; a new rxcom takes over after a backoff.
 //!
 //! Waiting for the X server does not count. A stalled or grabbed server freezes
 //! the desktop whatever rxcom does, and rxcom carries on once it answers.
@@ -13,9 +13,16 @@ use std::time::{Duration, Instant};
 /// When the current turn started, in ms since START plus one; 0 while idle.
 static BUSY_SINCE: AtomicU64 = AtomicU64::new(0);
 static START: OnceLock<Instant> = OnceLock::new();
+/// After this many restarts in a row rxcom gives up.
+const MAX_RESTARTS: u32 = 5;
 
 fn now_ms() -> u64 {
     START.get_or_init(Instant::now).elapsed().as_millis() as u64 + 1
+}
+
+/// How many times the watchdog has restarted rxcom so far.
+pub fn restarts() -> u32 {
+    std::env::var("RXCOM_RESTARTS").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
 }
 
 /// Whether the thread is blocked in poll(), which for rxcom's main thread
@@ -30,6 +37,22 @@ fn waiting_on_fd(tid: libc::pid_t) -> bool {
     polls.contains(&nr)
 }
 
+fn restart() {
+    let n = restarts() + 1;
+    if n > MAX_RESTARTS {
+        log::error!("restarted {MAX_RESTARTS} times already; giving up");
+        return;
+    }
+    let child = std::process::Command::new("/proc/self/exe")
+        .args(std::env::args_os().skip(1))
+        .env("RXCOM_RESTARTS", n.to_string())
+        .spawn();
+    match child {
+        Ok(c) => log::error!("restarting as pid {} (restart {n})", c.id()),
+        Err(e) => log::error!("cannot restart: {e}"),
+    }
+}
+
 /// Starts the watchdog for the calling thread, the main loop's.
 pub fn start(limit: Duration) {
     now_ms();
@@ -41,11 +64,14 @@ pub fn start(limit: Duration) {
             let since = BUSY_SINCE.load(Ordering::Relaxed);
             let stuck = now_ms().saturating_sub(since);
             if since == 0 || stuck <= limit.as_millis() as u64 {
-                warned = 0;
                 continue;
             }
             if !waiting_on_fd(main) {
-                log::error!("stuck for {} s in one turn of the loop; aborting so the X server restores the screen", stuck / 1000);
+                log::error!(
+                    "stuck for {} s in one turn of the loop; aborting so the X server restores the screen",
+                    stuck / 1000
+                );
+                restart();
                 std::process::abort();
             }
             if since != warned {

@@ -1,16 +1,19 @@
 //! The X side: connection, extensions, the compositing manager selection, the
 //! overlay window, picture formats and small request helpers.
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
 use std::ffi::CString;
+use std::os::fd::OwnedFd;
 use x11rb::connection::{Connection, RequestConnection};
 use x11rb::protocol::composite::{self, ConnectionExt as _};
 use x11rb::protocol::damage::{self, ConnectionExt as _};
-use x11rb::protocol::present::{self, ConnectionExt as _};
+use x11rb::protocol::dri3::{self, ConnectionExt as _};
 use x11rb::protocol::render::{self, ConnectionExt as _, PictType};
 use x11rb::protocol::shape::{self, ConnectionExt as _};
+use x11rb::protocol::sync::ConnectionExt as _;
 use x11rb::protocol::xfixes::ConnectionExt as _;
+use x11rb::protocol::xinput::{self, ConnectionExt as _};
 use x11rb::protocol::xproto::{
     AtomEnum, ChangeWindowAttributesAux, ConnectionExt as _, CreateWindowAux, EventMask, GetGeometryReply,
     GetWindowAttributesReply, PropMode, Window, WindowClass,
@@ -23,8 +26,6 @@ pub struct Atoms {
     pub xrootpmap_id: u32,
     pub esetroot_pmap_id: u32,
     pub picom_zoom: u32,
-    pub net_wm_name: u32,
-    pub utf8_string: u32,
     pub xfree86_vt: u32,
 }
 
@@ -44,9 +45,12 @@ pub struct X {
     pub height: u16,
     pub atoms: Atoms,
     visual_formats: HashMap<u32, Format>,
-    depth_formats: HashMap<u8, Format>,
-    /// The Present extension, for pacing frames to the vblank.
-    pub present: bool,
+    /// The standard ARGB32 format, for depth-32 pixmaps.
+    argb32: Option<Format>,
+    /// DRI3 1.2, to share the scene with Vulkan.
+    pub dri3: bool,
+    /// XInput 2.2, for raw pointer motion.
+    pub xi2: bool,
     /// Owns the _NET_WM_CM_Sn selection.
     pub owner: Window,
     pub overlay: Window,
@@ -75,8 +79,13 @@ impl X {
             bail!("RENDER {}.{} is too old, need 0.6", v.major_version, v.minor_version);
         }
         conn.shape_query_version()?.reply().context("no SHAPE extension")?;
-        let present = conn.extension_information(present::X11_EXTENSION_NAME)?.is_some()
-            && conn.present_query_version(1, 0)?.reply().is_ok();
+        let dri3 = conn.extension_information(dri3::X11_EXTENSION_NAME)?.is_some()
+            && conn.dri3_query_version(1, 2)?.reply().is_ok_and(|v| (v.major_version, v.minor_version) >= (1, 2));
+        let xi2 = conn.extension_information(xinput::X11_EXTENSION_NAME)?.is_some()
+            && conn.xinput_xi_query_version(2, 2)?.reply().is_ok();
+        conn.sync_initialize(3, 1)?.reply().context("no SYNC extension")?;
+        // The X server's scheduler then serves rxcom's requests ahead of busy clients.
+        conn.sync_set_priority(x11rb::NONE, 10)?;
 
         let pf = conn.render_query_pict_formats()?.reply()?;
         let alpha_of: HashMap<u32, bool> = pf
@@ -93,19 +102,12 @@ impl X {
                 }
             }
         }
-        // Pixmaps have no visual; pick the standard formats by depth.
-        let mut depth_formats = HashMap::new();
-        for f in pf.formats.iter().filter(|f| f.type_ == PictType::DIRECT) {
+        let argb32 = pf.formats.iter().find(|f| {
             let d = &f.direct;
-            let standard = match f.depth {
-                24 => d.alpha_mask == 0 && (d.red_shift, d.green_shift, d.blue_shift) == (16, 8, 0),
-                32 => d.alpha_mask == 0xff && (d.alpha_shift, d.red_shift, d.green_shift, d.blue_shift) == (24, 16, 8, 0),
-                _ => false,
-            };
-            if standard {
-                depth_formats.insert(f.depth, Format { id: f.id, alpha: d.alpha_mask != 0 });
-            }
-        }
+            f.depth == 32
+                && (d.alpha_mask, d.alpha_shift, d.red_shift, d.green_shift, d.blue_shift) == (0xff, 24, 16, 8, 0)
+        });
+        let argb32 = argb32.map(|f| Format { id: f.id, alpha: true });
         if !visual_formats.contains_key(&root_visual) {
             bail!("no picture format for the root visual");
         }
@@ -115,8 +117,6 @@ impl X {
             xrootpmap_id: intern(&conn, "_XROOTPMAP_ID")?,
             esetroot_pmap_id: intern(&conn, "ESETROOT_PMAP_ID")?,
             picom_zoom: intern(&conn, "_PICOM_ZOOM")?,
-            net_wm_name: intern(&conn, "_NET_WM_NAME")?,
-            utf8_string: intern(&conn, "UTF8_STRING")?,
             xfree86_vt: intern(&conn, "XFree86_VT")?,
         };
         Ok(X {
@@ -128,8 +128,9 @@ impl X {
             height,
             atoms,
             visual_formats,
-            depth_formats,
-            present,
+            argb32,
+            dri3,
+            xi2,
             owner: x11rb::NONE,
             overlay: x11rb::NONE,
         })
@@ -139,8 +140,13 @@ impl X {
         self.visual_formats.get(&visual).copied()
     }
 
-    pub fn depth_format(&self, depth: u8) -> Option<Format> {
-        self.depth_formats.get(&depth).copied()
+    /// The format for a pixmap of `depth`, which has no visual of its own.
+    pub fn pixmap_format(&self, depth: u8) -> Option<Format> {
+        match depth {
+            32 => self.argb32,
+            d if d == self.conn.setup().roots[self.screen].root_depth => Some(self.root_format()),
+            _ => None,
+        }
     }
 
     pub fn root_format(&self) -> Format {
@@ -148,7 +154,8 @@ impl X {
     }
 
     /// Takes the compositing manager selection, redirects all top-level windows and
-    /// gets the overlay window. Refuses when another compositor is running.
+    /// gets the overlay window. Refuses when another compositor is running; if
+    /// this fails halfway, rxcom exits and the X server undoes the rest.
     pub fn become_compositor(&mut self) -> Result<()> {
         let c = &self.conn;
         let sel = self.atoms.cm_selection;
@@ -156,37 +163,17 @@ impl X {
         if owner != x11rb::NONE {
             bail!("another compositor is running (window 0x{owner:x} owns _NET_WM_CM_S{})", self.screen);
         }
-
         let w = c.generate_id()?;
-        c.create_window(
-            0,
-            w,
-            self.root,
-            -1,
-            -1,
-            1,
-            1,
-            0,
-            WindowClass::INPUT_ONLY,
-            0,
-            &CreateWindowAux::new().override_redirect(1),
-        )?
-        .check()?;
+        let aux = CreateWindowAux::new().override_redirect(1);
+        c.create_window(0, w, self.root, -1, -1, 1, 1, 0, WindowClass::INPUT_ONLY, 0, &aux)?.check()?;
         c.change_property8(PropMode::REPLACE, w, AtomEnum::WM_NAME, AtomEnum::STRING, b"rxcom")?;
-        c.change_property8(PropMode::REPLACE, w, self.atoms.net_wm_name, self.atoms.utf8_string, b"rxcom")?;
         c.set_selection_owner(w, sel, x11rb::CURRENT_TIME)?;
         if c.get_selection_owner(sel)?.reply()?.owner != w {
-            c.destroy_window(w)?;
             bail!("lost the race for _NET_WM_CM_S{} to another compositor", self.screen);
         }
         self.owner = w;
-
-        if let Err(e) = c.composite_redirect_subwindows(self.root, composite::Redirect::MANUAL)?.check() {
-            c.destroy_window(w)?;
-            c.flush()?;
-            self.owner = x11rb::NONE;
-            return Err(anyhow!("cannot redirect the root's children (another compositor?): {e:?}"));
-        }
+        let redirect = c.composite_redirect_subwindows(self.root, composite::Redirect::MANUAL)?;
+        redirect.check().context("cannot redirect the root's children (another compositor?)")?;
 
         self.overlay = c.composite_get_overlay_window(self.root)?.reply()?.overlay_win;
         // An empty input shape lets every click fall through to the windows below.
@@ -198,9 +185,8 @@ impl X {
 
         c.change_window_attributes(
             self.root,
-            &ChangeWindowAttributesAux::new().event_mask(
-                EventMask::SUBSTRUCTURE_NOTIFY | EventMask::STRUCTURE_NOTIFY | EventMask::PROPERTY_CHANGE,
-            ),
+            &ChangeWindowAttributesAux::new()
+                .event_mask(EventMask::SUBSTRUCTURE_NOTIFY | EventMask::STRUCTURE_NOTIFY | EventMask::PROPERTY_CHANGE),
         )?
         .check()
         .context("cannot select SubstructureNotify on the root")?;
@@ -233,9 +219,8 @@ impl X {
             self.overlay = x11rb::NONE;
         }
         if self.owner != x11rb::NONE {
-            let _ = c
-                .composite_unredirect_subwindows(self.root, composite::Redirect::MANUAL)
-                .map(|ck| ck.ignore_error());
+            let _ =
+                c.composite_unredirect_subwindows(self.root, composite::Redirect::MANUAL).map(|ck| ck.ignore_error());
             // Destroying the owner window gives up the selection.
             let _ = c.destroy_window(self.owner).map(|ck| ck.ignore_error());
             self.owner = x11rb::NONE;
@@ -312,16 +297,80 @@ impl X {
         self.root_cardinal(self.atoms.xfree86_vt, AtomEnum::INTEGER)
     }
 
-    /// Asks for a PresentCompleteNotify event on the overlay at its next vblank.
-    pub fn select_present(&self) -> Result<()> {
-        let eid = self.conn.generate_id()?;
-        self.conn.present_select_input(eid, self.overlay, present::EventMask::COMPLETE_NOTIFY)?;
+    /// Raw motion of any pointer, delivered on the root whatever window has it.
+    pub fn watch_pointer(&self, on: bool) -> Result<()> {
+        if self.xi2 {
+            let mask = if on { xinput::XIEventMask::RAW_MOTION } else { 0u32.into() };
+            let m = xinput::EventMask { deviceid: xinput::Device::ALL_MASTER.into(), mask: vec![mask] };
+            self.conn.xinput_xi_select_events(self.root, &[m])?;
+        }
         Ok(())
     }
 
-    pub fn notify_next_vblank(&self, serial: u32) -> Result<()> {
-        self.conn.present_notify_msc(self.overlay, serial, 0, 1, 0)?;
-        Ok(())
+    /// The DRM modifiers the X server takes for a depth-24 pixmap on this screen.
+    pub fn modifiers(&self) -> Result<Vec<u64>> {
+        let r = self.conn.dri3_get_supported_modifiers(self.root, 24, 32)?.reply()?;
+        let mut m = r.window_modifiers;
+        m.extend(r.screen_modifiers.iter().filter(|s| !m.contains(s)).copied().collect::<Vec<_>>());
+        Ok(m)
+    }
+
+    /// Wraps a single-plane dma-buf of depth 24 in a new pixmap.
+    pub fn import_pixmap(&self, fd: OwnedFd, (w, h): (u16, u16), stride: u32, offset: u32, m: u64) -> Result<u32> {
+        let p = self.conn.generate_id()?;
+        let c = self.conn.dri3_pixmap_from_buffers(
+            p,
+            self.root,
+            w,
+            h,
+            stride,
+            offset,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            24,
+            32,
+            m,
+            vec![fd],
+        );
+        c?.check().context("DRI3 PixmapFromBuffers")?;
+        Ok(p)
+    }
+
+    /// The dma-buf behind a pixmap: (fd, stride, offset, modifier).
+    pub fn buffer_from_pixmap(&self, pixmap: u32) -> Result<(OwnedFd, u32, u32, u64)> {
+        let mut r = self.conn.dri3_buffers_from_pixmap(pixmap)?.reply().context("DRI3 BuffersFromPixmap")?;
+        if r.buffers.len() != 1 || r.bpp != 32 {
+            bail!("pixmap has {} planes at {} bpp", r.buffers.len(), r.bpp);
+        }
+        Ok((r.buffers.remove(0), r.strides[0], r.offsets[0], r.modifier))
+    }
+
+    pub fn create_fence(&self) -> Result<u32> {
+        let f = self.conn.generate_id()?;
+        self.conn.sync_create_fence(self.root, f, false)?;
+        Ok(f)
+    }
+
+    /// Waits for everything the X server has queued so far to finish on its GPU,
+    /// polling the fence with QueryFence. It never sends SyncAwaitFence, whose
+    /// wakeup NVIDIA's X driver sometimes loses. Returns false after `limit`.
+    pub fn sync_gpu(&self, fence: u32, limit: std::time::Duration) -> Result<bool> {
+        let start = std::time::Instant::now();
+        self.conn.sync_trigger_fence(fence)?;
+        loop {
+            if self.conn.sync_query_fence(fence)?.reply()?.triggered {
+                self.conn.sync_reset_fence(fence)?;
+                return Ok(true);
+            }
+            if start.elapsed() >= limit {
+                return Ok(false);
+            }
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        }
     }
 
     pub fn create_picture(&self, drawable: u32, format: Format) -> Result<u32> {

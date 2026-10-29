@@ -290,7 +290,7 @@ if [ -z "$external" ]; then
 fi
 
 echo "9. no warnings or errors in the log"
-problems=$(grep -E 'WARN|ERROR' "$out/rxcom.log")
+problems=$(grep -E 'WARN|ERROR|VUID|Validation' "$out/rxcom.log")
 echo "$problems" | head -5
 check test -z "$problems"
 

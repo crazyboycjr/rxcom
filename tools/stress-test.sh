@@ -7,6 +7,9 @@
 # hold no warnings or errors.
 #
 #   CARGO_TARGET_DIR=... tools/stress-test.sh [display number] [steps]
+#
+# With RXCOM_TEST_EXTERNAL=1 the display must already be running (for example
+# tools/xwayland.sh, so rxcom presents with Vulkan) and is left running.
 set -uo pipefail
 n=${1:-24}
 steps=${2:-300}
@@ -24,11 +27,11 @@ rx=
 cleanup() {
 	[ -n "$rx" ] && kill "$rx" 2>/dev/null
 	kill "${pids[@]}" 2>/dev/null
-	"$here/nested.sh" stop "$n" >/dev/null
+	[ -n "${RXCOM_TEST_EXTERNAL:-}" ] || "$here/nested.sh" stop "$n" >/dev/null
 }
 trap cleanup EXIT
 
-"$here/nested.sh" start "$n" || exit 1
+[ -n "${RXCOM_TEST_EXTERNAL:-}" ] || "$here/nested.sh" start "$n" || exit 1
 magick -size 1920x1080 gradient:'#203050'-'#a07040' "$out/wall1.png"
 magick -size 1920x1080 gradient:'#305020'-'#4070a0' -fill black -draw 'circle 400,400 400,500' "$out/wall2.png"
 feh --no-fehbg --bg-tile "$out/wall1.png"
@@ -102,6 +105,6 @@ import -window root "$out/uncomposited.png"
 echo "rxcom exit status $status"
 python3 "$here/compare.py" "$out/uncomposited.png" "$out/composited.png"
 same=$?
-problems=$(grep -E "WARN|ERROR" "$out/rxcom.log")
+problems=$(grep -E "WARN|ERROR|VUID|Validation" "$out/rxcom.log")
 echo "${problems:-no warnings or errors in the log}" | head -10
 [ "$status" -eq 0 ] && [ "$same" -eq 0 ] && [ -z "$problems" ]

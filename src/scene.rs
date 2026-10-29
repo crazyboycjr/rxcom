@@ -35,11 +35,17 @@ fn fixed(v: f64) -> i32 {
 }
 
 impl Scene {
-    pub fn new(x: &X) -> Result<Scene> {
+    /// A scene on `pixmap` (the one shared with Vulkan), or on a new pixmap.
+    pub fn new(x: &X, pixmap: Option<u32>) -> Result<Scene> {
         let c = &x.conn;
-        let depth = c.setup().roots[x.screen].root_depth;
-        let pixmap = c.generate_id()?;
-        c.create_pixmap(depth, pixmap, x.root, x.width, x.height)?;
+        let pixmap = match pixmap {
+            Some(p) => p,
+            None => {
+                let p = c.generate_id()?;
+                c.create_pixmap(c.setup().roots[x.screen].root_depth, p, x.root, x.width, x.height)?;
+                p
+            }
+        };
         let format = x.root_format();
         let full = Rectangle { x: 0, y: 0, width: x.width, height: x.height };
         let (damage, scratch) = (c.generate_id()?, c.generate_id()?);
@@ -97,15 +103,7 @@ impl Scene {
     pub fn paint<'a>(&mut self, x: &X, bg: &Background, wins: impl Iterator<Item = &'a Win>) -> Result<()> {
         let c = &x.conn;
         c.xfixes_set_picture_clip_region(self.target, self.damage, 0, 0)?;
-        match bg.picture {
-            Some(p) => c.render_composite(PictOp::SRC, p, NONE, self.target, 0, 0, 0, 0, 0, 0, self.width, self.height)?,
-            None => c.render_fill_rectangles(
-                PictOp::SRC,
-                self.target,
-                bg.color,
-                &[Rectangle { x: 0, y: 0, width: self.width, height: self.height }],
-            )?,
-        };
+        c.render_composite(PictOp::SRC, bg.picture, NONE, self.target, 0, 0, 0, 0, 0, 0, self.width, self.height)?;
         for w in wins.filter(|w| w.drawable()) {
             let Some(picture) = w.picture else { continue };
             let r = w.geom.outer();
@@ -157,44 +155,38 @@ impl Scene {
 
 /// What lies under the windows: the root pixmap tiled, or a solid colour.
 pub struct Background {
-    pub picture: Option<u32>,
-    pub pixmap: Option<u32>,
-    pub color: render::Color,
+    pub picture: u32,
+    color: render::Color,
 }
 
 impl Background {
     pub fn new(rgb: u32) -> Self {
         let c = |shift: u32| (((rgb >> shift) & 0xff) * 0x101) as u16;
-        Background { picture: None, pixmap: None, color: render::Color { red: c(16), green: c(8), blue: c(0), alpha: 0xffff } }
+        Background { picture: NONE, color: render::Color { red: c(16), green: c(8), blue: c(0), alpha: 0xffff } }
     }
 
-    /// Uses `pixmap` (the root pixmap) from now on; None means the solid colour.
+    /// Uses `pixmap` (the root pixmap) from now on, or the solid colour.
     pub fn set(&mut self, x: &X, pixmap: Option<u32>) -> Result<()> {
         self.release(x);
-        let Some(p) = pixmap else {
-            log::info!("no root pixmap; solid background");
-            return Ok(());
-        };
-        let Ok(g) = x.conn.get_geometry(p)?.reply() else {
-            log::warn!("root pixmap 0x{p:x} is gone; solid background");
-            return Ok(());
-        };
-        let Some(format) = x.depth_format(g.depth) else {
-            log::warn!("root pixmap 0x{p:x} has depth {}; solid background", g.depth);
-            return Ok(());
-        };
-        let picture = x.conn.generate_id()?;
-        x.conn.render_create_picture(picture, p, format.id, &render::CreatePictureAux::new().repeat(render::Repeat::NORMAL))?;
-        log::info!("background: root pixmap 0x{p:x}, {}x{}", g.width, g.height);
-        self.picture = Some(picture);
-        self.pixmap = Some(p);
+        self.picture = x.conn.generate_id()?;
+        let usable = pixmap.and_then(|p| Some((p, x.conn.get_geometry(p).ok()?.reply().ok()?)));
+        if let Some((p, g)) = usable
+            && let Some(format) = x.pixmap_format(g.depth)
+        {
+            let aux = render::CreatePictureAux::new().repeat(render::Repeat::NORMAL);
+            x.conn.render_create_picture(self.picture, p, format.id, &aux)?;
+            log::info!("background: root pixmap 0x{p:x}, {}x{}", g.width, g.height);
+        } else {
+            x.conn.render_create_solid_fill(self.picture, self.color)?;
+            log::info!("background: solid, no usable root pixmap");
+        }
         Ok(())
     }
 
     pub fn release(&mut self, x: &X) {
-        if let Some(p) = self.picture.take() {
-            let _ = x.conn.render_free_picture(p);
+        if self.picture != NONE {
+            let _ = x.conn.render_free_picture(self.picture);
+            self.picture = NONE;
         }
-        self.pixmap = None;
     }
 }

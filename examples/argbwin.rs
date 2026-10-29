@@ -16,8 +16,8 @@ use std::time::{Duration, Instant};
 use x11rb::connection::Connection;
 use x11rb::protocol::Event;
 use x11rb::protocol::xproto::{
-    AtomEnum, ChangeWindowAttributesAux, ColormapAlloc, ConnectionExt as _, CreateGCAux, CreateWindowAux, EventMask, ImageFormat, PropMode,
-    VisualClass, WindowClass,
+    AtomEnum, ChangeWindowAttributesAux, ColormapAlloc, ConnectionExt as _, CreateGCAux, CreateWindowAux, EventMask,
+    ImageFormat, PropMode, VisualClass, WindowClass,
 };
 use x11rb::wrapper::ConnectionExt as _;
 
@@ -151,9 +151,11 @@ fn main() -> Result<()> {
                 for x in 0..w {
                     let mut p = pixel(&a, size, x as u32, y as u32);
                     if let Some(b) = bar
-                        && x >= b && x < b + 20 {
-                            p = 0xff000000 | 0x00ffff00;
-                        }
+                        && x >= b
+                        && x < b + 20
+                    {
+                        p = 0xff000000 | 0x00ffff00;
+                    }
                     data.extend_from_slice(&p.to_le_bytes());
                 }
             }
