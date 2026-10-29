@@ -179,7 +179,84 @@ PY
 kill "$blink"
 sleep 0.5
 
-echo "6. a full-screen opaque window gets the screen after 200 ms, and gives it back"
+echo "6. a window mapped again or resized shows what the screen showed there until its"
+echo "   client draws, not the X server's copy of the screen pixmap, which flips leave old"
+"$bin/examples/argbwin" --geometry 500x300+300+200 --depth 24 --color ffe0c000 --border 3 \
+	--no-background --delay 1500 --name late24 &
+late24=$!
+"$bin/examples/argbwin" --geometry 400x250+1000+400 --depth 32 --color c0004080 --border 3 \
+	--no-background --delay 1500 --name late32 &
+late32=$!
+pids+=("$late24" "$late32")
+sleep 2.5
+l24=$(xdotool search --name '^late24$')
+l32=$(xdotool search --name '^late32$')
+xdotool windowunmap "$l24" windowunmap "$l32"
+sleep 0.5
+shot late_before
+# Junk in the screen pixmap, where a flipping presenter leaves an old frame.
+"$bin/examples/argbwin" --overlay --color ffff00ff
+xdotool windowmap "$l24" windowmap "$l32"
+sleep 0.5
+shot late_mapped
+check python3 "$here/compare.py" "$out/late_before.png" "$out/late_mapped.png" \
+	--only 300,200,506,306 --only 1000,400,406,256
+sleep 2
+shot late_drawn
+echo "   then the client's own pixels:"
+check python3 - "$out/late_drawn.png" <<'PY'
+import sys
+import numpy as np
+from PIL import Image
+a = np.asarray(Image.open(sys.argv[1]).convert("RGB")).astype(int)
+sys.exit(0 if (a[203:503, 303:803] == [0xE0, 0xC0, 0]).all() else 1)
+PY
+echo "   resized, until its client draws again:"
+"$bin/examples/argbwin" --overlay --color ff00ffff
+xdotool windowsize "$l24" 640 360
+sleep 0.5
+shot late_resized
+check python3 - "$out/late_resized.png" <<'PY'
+import sys
+import numpy as np
+from PIL import Image
+a = np.asarray(Image.open(sys.argv[1]).convert("RGB")).astype(int)[200:566, 300:946]
+junk = (a == [0xFF, 0, 0xFF]).all(axis=2) | (a == [0, 0xFF, 0xFF]).all(axis=2)
+print(f"   junk pixels: {junk.sum()}")
+sys.exit(1 if junk.any() else 0)
+PY
+echo "   drawn in slow parts, it shows none of the copy until all parts are drawn:"
+"$bin/examples/argbwin" --geometry 500x300+1350+750 --depth 24 --color ff30a0e0 --border 3 \
+	--no-background --band-delay 60 --name bands &
+bands=$!
+pids+=("$bands")
+sleep 1.5
+bw=$(xdotool search --name '^bands$')
+xdotool windowunmap "$bw"
+sleep 0.3
+"$bin/examples/argbwin" --overlay --color ffff00ff
+xdotool windowmap "$bw"
+# Ten bands 60 ms apart: about half are drawn now.
+sleep 0.3
+shot bands_half
+sleep 1
+shot bands_done
+check python3 - "$out/bands_half.png" "$out/bands_done.png" <<'PY'
+import sys
+import numpy as np
+from PIL import Image
+half, done = (np.asarray(Image.open(p).convert("RGB")).astype(int) for p in sys.argv[1:])
+junk = int((half[750:1056, 1350:1856] == [0xFF, 0, 0xFF]).all(axis=2).sum())
+drawn = bool((done[753:1053, 1353:1853] == [0x30, 0xA0, 0xE0]).all())
+print(f"   junk pixels halfway: {junk}; drawn in full at the end: {drawn}")
+sys.exit(0 if junk == 0 and drawn else 1)
+PY
+kill "$late24" "$late32" "$bands"
+# The X presenter left junk where nothing was redrawn; a wallpaper redraws all.
+feh --no-fehbg --bg-tile "$out/wallpaper.png"
+sleep 0.5
+
+echo "7. a full-screen opaque window gets the screen after 200 ms, and gives it back"
 "$bin/examples/argbwin" --geometry 1920x1080+0+0 --depth 24 --color ff406080 --animate \
 	--override-redirect --name fullscreen &
 fs=$!
@@ -217,7 +294,7 @@ PY
 kill "$popup" "$fs"
 sleep 0.7
 
-echo "7. SIGTERM shuts down cleanly and leaves the screen as found"
+echo "8. SIGTERM shuts down cleanly and leaves the screen as found"
 shot before_exit
 kill -TERM "$rx"
 wait "$rx"
@@ -261,7 +338,7 @@ check grep -q "released the screen" "$out/rxcom3.log"
 kill "$anim2"
 
 if [ -z "$external" ]; then
-	echo "8. the X server stops answering for 7 s mid-zoom: the watchdog warns, rxcom"
+	echo "9. the X server stops answering for 7 s mid-zoom: the watchdog warns, rxcom"
 	echo "   waits it out and carries on"
 	"$bin/rxcom" >"$out/rxcom4.log" 2>&1 &
 	rx=$!
@@ -289,7 +366,7 @@ if [ -z "$external" ]; then
 	check test "$status" -eq 0
 fi
 
-echo "9. no warnings or errors in the log"
+echo "10. no warnings or errors in the log"
 problems=$(grep -E 'WARN|ERROR|VUID|Validation' "$out/rxcom.log")
 echo "$problems" | head -5
 check test -z "$problems"

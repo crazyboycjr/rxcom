@@ -4,7 +4,7 @@ use crate::gpu::Gpu;
 use crate::scene::{Background, Scene};
 use crate::vt::Vt;
 use crate::watchdog;
-use crate::windows::{Geometry, Win, WinList};
+use crate::windows::{Geometry, Undrawn, Win, WinList, covers};
 use crate::x::{X, error_is_benign};
 use crate::zoom::{View, Zoom};
 use anyhow::{Context, Result};
@@ -14,13 +14,14 @@ use x11rb::NONE;
 use x11rb::connection::Connection;
 use x11rb::protocol::Event;
 use x11rb::protocol::composite::ConnectionExt as _;
-use x11rb::protocol::damage::ConnectionExt as _;
+use x11rb::protocol::damage::{ConnectionExt as _, ReportLevel};
 use x11rb::protocol::render::ConnectionExt as _;
 use x11rb::protocol::shape::{self, ConnectionExt as _};
 use x11rb::protocol::sync::ConnectionExt as _;
 use x11rb::protocol::xfixes::ConnectionExt as _;
 use x11rb::protocol::xproto::{
-    AtomEnum, GetGeometryReply, GetWindowAttributesReply, MapState, Place, Property, Window, WindowClass,
+    AtomEnum, ChangeWindowAttributesAux, ConnectionExt as _, EventMask, GetGeometryReply, GetWindowAttributesReply,
+    MapState, Place, Property, Rectangle, Window, WindowClass,
 };
 
 pub struct Options {
@@ -42,6 +43,11 @@ const WARP_POLL: Duration = Duration::from_millis(100);
 /// How long rxcom polls the X server's fence before drawing anyway.
 const FENCE_LIMIT: Duration = Duration::from_millis(100);
 const GPU_RETRIES: u32 = 3;
+/// How long rxcom waits for the X server's Expose after a map, and for the
+/// client of a resized window to draw before it asks for a drawing again.
+const DRAW_WAIT: Duration = Duration::from_millis(50);
+/// How long a window waits for the rest once its client has drawn part of it.
+const DRAWING_LIMIT: Duration = Duration::from_millis(500);
 const STATS_EVERY: Duration = Duration::from_secs(10);
 
 #[derive(Default)]
@@ -53,6 +59,7 @@ struct Stats {
     fence_sum: Duration,
     fence_max: Duration,
     fence_timeouts: u32,
+    damage_events: u32,
 }
 
 pub struct Compositor {
@@ -130,25 +137,39 @@ fn try_gpu(x: &X, display: Option<&str>) -> (Option<Gpu>, Option<u32>) {
     }
 }
 
+/// Starts watching the window's drawing operation by operation, until its
+/// client has drawn (`Win::witness`).
+fn watch(x: &X, w: &mut Win) {
+    if w.witness.is_none() && w.damage.is_some() {
+        w.witness = x.create_damage(w.id, ReportLevel::RAW_RECTANGLES).ok();
+    }
+}
+
 /// Names the window's pixmap and puts a picture on it, clipped to its bounding
 /// shape when it has one. Errors (the window went away meanwhile) come back as
-/// events and are ignored; its events are on the way.
-fn bind(x: &X, w: &mut Win) -> Result<()> {
+/// events and are ignored; its events are on the way. While the client has not
+/// drawn into the new pixmap, a copy of the scene where the window lies stands
+/// in for it, as the X presenter's screen would.
+fn bind(x: &X, scene: &Scene, w: &mut Win) -> Result<()> {
     w.release(&x.conn);
     let pixmap = x.conn.generate_id()?;
     x.conn.composite_name_window_pixmap(w.id, pixmap)?;
     let format = x.visual_format(w.visual).unwrap_or(x.root_format());
     let picture = x.create_picture(pixmap, format)?;
+    let stand_in = if w.undrawn.is_some() { scene.snapshot(x, w.geom.outer())? } else { None };
     if w.shaped {
         let region = x.conn.generate_id()?;
         x.conn.xfixes_create_region_from_window(region, w.id, shape::SK::BOUNDING)?;
         // The region starts at the window's inside, the pixmap at its border.
         let b = w.geom.border as i16;
         x.conn.xfixes_translate_region(region, b, b)?;
-        x.conn.xfixes_set_picture_clip_region(picture, region, 0, 0)?;
+        for p in std::iter::once(picture).chain(stand_in.map(|s| s.1)) {
+            x.conn.xfixes_set_picture_clip_region(p, region, 0, 0)?;
+        }
         x.conn.xfixes_destroy_region(region)?;
     }
     (w.pixmap, w.picture, w.alpha, w.stale) = (Some(pixmap), Some(picture), format.alpha, false);
+    w.stand_in = stand_in;
     Ok(())
 }
 
@@ -257,8 +278,13 @@ impl Compositor {
             ..Default::default()
         };
         if !w.input_only && !w.ignored {
-            w.damage = self.x.create_damage(id).ok();
+            w.damage = self.x.create_damage(id, ReportLevel::NON_EMPTY).ok();
+            if !w.mapped {
+                watch(&self.x, &mut w);
+            }
             self.x.conn.shape_select_input(id, true)?;
+            let exposures = ChangeWindowAttributesAux::new().event_mask(EventMask::EXPOSURE);
+            self.x.conn.change_window_attributes(id, &exposures)?;
             w.shaped = self.x.bounding_shaped(id);
         }
         if w.drawable() {
@@ -271,12 +297,58 @@ impl Compositor {
         Ok(())
     }
 
+    /// A window that appeared on the root while rxcom runs. When its client
+    /// mapped it at once, the X server asked it to draw before rxcom could
+    /// watch, so rxcom asks again: ClearArea repaints the window's background,
+    /// if it has one, and sends Expose.
+    fn adopt(&mut self, id: Window) -> Result<()> {
+        let Some((a, g)) = self.x.query_window(id) else { return Ok(()) };
+        self.add_window(id, &a, &g)?;
+        if let Some(w) = self.wins.get_mut(id)
+            && w.drawable()
+        {
+            watch(&self.x, w);
+            w.undrawn = Some(Undrawn::Mapped(Instant::now() + DRAW_WAIT));
+            self.x.conn.clear_area(true, id, 0, 0, 0, 0)?;
+        }
+        Ok(())
+    }
+
+    /// Ends the waits that have a deadline. A window that got no Expose shows
+    /// its own pixels, as does one drawn only in part for too long. One
+    /// resized before rxcom watched it may have drawn unseen, or its client may
+    /// be slow: rxcom asks for a drawing it will see, which a slow client's
+    /// pending one absorbs. Returns how long until the next deadline.
+    fn expire_undrawn(&mut self, now: Instant) -> Result<Option<Duration>> {
+        let mut next: Option<Duration> = None;
+        for w in self.wins.iter_mut() {
+            let t = match w.undrawn {
+                Some(Undrawn::Asked(Some(t))) if t <= now => {
+                    self.x.conn.clear_area(true, w.id, 0, 0, 0, 0)?;
+                    let t = now + DRAW_WAIT;
+                    w.undrawn = Some(Undrawn::Mapped(t));
+                    t
+                }
+                Some(Undrawn::Mapped(t) | Undrawn::Asked(Some(t)) | Undrawn::Drawing(_, t)) => t,
+                _ => continue,
+            };
+            if t > now {
+                next = Some(next.map_or(t - now, |n| n.min(t - now)));
+            } else if let Some(r) = w.drawn(&self.x.conn) {
+                self.scene.add_rect(&self.x, r)?;
+            }
+        }
+        Ok(next)
+    }
+
     fn forget_window(&mut self, id: Window, destroyed: bool) -> Result<()> {
         let Some(mut w) = self.wins.remove(id) else { return Ok(()) };
         w.release(&self.x.conn);
-        if let (Some(d), false) = (w.damage, destroyed) {
-            // A destroyed window took its damage object with it.
-            let _ = self.x.conn.damage_destroy(d);
+        // A destroyed window took its damage objects with it.
+        if !destroyed {
+            for d in [w.damage, w.witness].into_iter().flatten() {
+                let _ = self.x.conn.damage_destroy(d);
+            }
         }
         if w.drawable() {
             self.scene.add_rect(&self.x, w.geom.outer())?;
@@ -300,20 +372,53 @@ impl Compositor {
         Ok(())
     }
 
+    /// One rectangle of one drawing operation on a window waiting for its
+    /// client, `a` starting at the window's inside. Once the X server has
+    /// asked the client to draw, damage within the window is the client's:
+    /// what the X server paints itself around a new pixmap reaches into the
+    /// border (it reports a border repaint as its bounding box), while a
+    /// client's drawing is clipped to the inside. The wait ends once the
+    /// client's drawing covers the window: at once for a GL swap or a whole
+    /// image, later for a drawing in parts, perhaps the end of one begun
+    /// before the window was mapped again.
+    fn witnessed(&mut self, id: Window, a: Rectangle) -> Result<()> {
+        let Some(w) = self.wins.get_mut(id) else { return Ok(()) };
+        let (width, height) = (w.geom.width, w.geom.height);
+        let within = a.x >= 0
+            && a.y >= 0
+            && i32::from(a.x) + i32::from(a.width) <= i32::from(width)
+            && i32::from(a.y) + i32::from(a.height) <= i32::from(height);
+        let (mut parts, until) = match &mut w.undrawn {
+            Some(Undrawn::Asked(_)) if within => (Vec::new(), Instant::now() + DRAWING_LIMIT),
+            Some(Undrawn::Drawing(parts, until)) if within => (std::mem::take(parts), *until),
+            _ => return Ok(()),
+        };
+        parts.push(a);
+        if !covers(&parts, width, height) {
+            w.undrawn = Some(Undrawn::Drawing(parts, until));
+        } else if let Some(r) = w.drawn(&self.x.conn) {
+            self.scene.add_rect(&self.x, r)?;
+        }
+        Ok(())
+    }
+
     fn handle(&mut self, ev: Event) -> Result<()> {
         let root = self.x.root;
         match ev {
-            Event::CreateNotify(e) if e.parent == root => {
-                if let Some((a, g)) = self.x.query_window(e.window) {
-                    self.add_window(e.window, &a, &g)?;
-                }
-            }
+            Event::CreateNotify(e) if e.parent == root => self.adopt(e.window)?,
             Event::DestroyNotify(e) => self.forget_window(e.window, true)?,
-            Event::MapNotify(e) => self.moved(e.window, |w| (w.mapped, w.stale) = (true, true))?,
+            Event::MapNotify(e) => self.moved(e.window, |w| {
+                // One mapped at creation was adopted mapped, waiting already.
+                if !w.mapped {
+                    w.undrawn = Some(Undrawn::Mapped(Instant::now() + DRAW_WAIT));
+                }
+                (w.mapped, w.stale) = (true, true);
+            })?,
             Event::UnmapNotify(e) => {
-                self.moved(e.window, |w| w.mapped = false)?;
+                self.moved(e.window, |w| (w.mapped, w.undrawn) = (false, None))?;
                 if let Some(w) = self.wins.get_mut(e.window) {
                     w.release(&self.x.conn);
+                    watch(&self.x, w);
                 }
             }
             Event::ConfigureNotify(e) if e.window == root => {
@@ -334,18 +439,26 @@ impl Compositor {
                 let g = Geometry { x: e.x, y: e.y, width: e.width, height: e.height, border: e.border_width };
                 self.moved(e.window, |w| {
                     let (old, new) = (w.geom.outer(), g.outer());
-                    w.stale |= w.mapped && (old.width, old.height, w.geom.border) != (new.width, new.height, g.border);
+                    // A new size means a new pixmap. Its client may redraw
+                    // before rxcom watches, so the wait has a deadline.
+                    if w.mapped && (old.width, old.height, w.geom.border) != (new.width, new.height, g.border) {
+                        w.stale = true;
+                        if !matches!(w.undrawn, Some(Undrawn::Mapped(_))) {
+                            w.undrawn = Some(Undrawn::Asked(Some(Instant::now() + DRAW_WAIT)));
+                        }
+                    }
                     w.geom = g;
                 })?;
+                if let Some(w) = self.wins.get_mut(e.window)
+                    && w.undrawn.is_some()
+                {
+                    watch(&self.x, w);
+                }
                 if !self.wins.restack(e.window, e.above_sibling) {
                     log::debug!("0x{:x} restacked above unknown 0x{:x}", e.window, e.above_sibling);
                 }
             }
-            Event::ReparentNotify(e) if e.parent == root => {
-                if let Some((a, g)) = self.x.query_window(e.window) {
-                    self.add_window(e.window, &a, &g)?;
-                }
-            }
+            Event::ReparentNotify(e) if e.parent == root => self.adopt(e.window)?,
             Event::ReparentNotify(e) => self.forget_window(e.window, false)?,
             Event::CirculateNotify(e) => {
                 if e.place == Place::ON_TOP {
@@ -356,17 +469,28 @@ impl Compositor {
                 self.moved(e.window, |_| ())?;
             }
             Event::GravityNotify(e) => self.moved(e.window, |w| (w.geom.x, w.geom.y) = (e.x, e.y))?,
-            Event::DamageNotify(e) => match self.wins.get(e.drawable) {
-                Some(w) if self.unredirected.is_none() && w.drawable() && !w.stale => {
-                    // The region starts at the window's inside; a repainted
-                    // border (xmonad's focus colour) lies at negative coordinates.
-                    let b = w.geom.border as i16;
-                    let (dx, dy) = (w.geom.x + b, w.geom.y + b);
-                    self.scene.add_window_damage(&self.x, e.damage, dx, dy)?;
+            Event::DamageNotify(e) => {
+                self.stats.damage_events += 1;
+                match self.wins.get(e.drawable) {
+                    Some(w) if w.witness == Some(e.damage) => self.witnessed(e.drawable, e.area)?,
+                    Some(w)
+                        if w.damage == Some(e.damage)
+                            && self.unredirected.is_none()
+                            && w.drawable()
+                            && !w.stale
+                            && w.stand_in.is_none() =>
+                    {
+                        // The region starts at the window's inside; a repainted
+                        // border (xmonad's focus colour) lies at negative coordinates.
+                        let b = w.geom.border as i16;
+                        let (dx, dy) = (w.geom.x + b, w.geom.y + b);
+                        self.scene.add_window_damage(&self.x, e.damage, dx, dy)?;
+                    }
+                    // Not on screen, about to be redrawn whole, behind its
+                    // stand-in, or a witness already gone.
+                    _ => drop(self.x.conn.damage_subtract(e.damage, NONE, NONE)?),
                 }
-                // Not on screen, or about to be redrawn whole anyway.
-                _ => drop(self.x.conn.damage_subtract(e.damage, NONE, NONE)?),
-            },
+            }
             Event::ShapeNotify(e) if e.shape_kind == shape::SK::BOUNDING => {
                 self.moved(e.affected_window, |w| (w.shaped, w.stale) = (e.shaped, w.stale || w.mapped))?
             }
@@ -386,6 +510,14 @@ impl Compositor {
                 }
             }
             Event::Expose(e) if e.window == self.x.overlay => self.full_present = true,
+            // The client is asked to draw what the X server mapped.
+            Event::Expose(e) => {
+                if let Some(w) = self.wins.get_mut(e.window)
+                    && let Some(Undrawn::Mapped(_)) = w.undrawn
+                {
+                    w.undrawn = Some(Undrawn::Asked(None));
+                }
+            }
             Event::SelectionClear(e) if e.selection == self.x.atoms.cm_selection => {
                 log::warn!("another compositor took over the screen; exiting");
                 // It owns the selection now; we must not touch the overlay or redirection.
@@ -433,8 +565,10 @@ impl Compositor {
                 log::info!("compositing again");
                 self.x.redirect()?;
                 self.unredirected = None;
-                for w in self.wins.iter_mut() {
-                    w.stale = w.mapped;
+                // New pixmaps again, copied from a screen the windows drew on.
+                for w in self.wins.iter_mut().filter(|w| w.mapped) {
+                    w.drawn(&self.x.conn);
+                    w.stale = true;
                 }
                 self.repaint_all()?;
             }
@@ -513,7 +647,7 @@ impl Compositor {
             self.stats.no_image += self.blocked_since.take().is_some() as u32;
         }
         for w in self.wins.iter_mut().filter(|w| w.drawable() && w.stale) {
-            bind(&self.x, w)?;
+            bind(&self.x, &self.scene, w)?;
         }
         let view = self.view();
         let painted = self.scene.dirty;
@@ -572,13 +706,14 @@ impl Compositor {
         let s = std::mem::take(&mut self.stats);
         log::debug!(
             "{} frames in {:.0} s, {} waited for a free image; X's GPU work took {:.2} ms a frame on average, \
-             at most {:.2} ms; {} fence timeouts",
+             at most {:.2} ms; {} fence timeouts; {} damage events",
             s.frames,
             (now - self.stats_since).as_secs_f64(),
             s.no_image,
             s.fence_sum.as_secs_f64() * 1e3 / s.frames.max(1) as f64,
             s.fence_max.as_secs_f64() * 1e3,
-            s.fence_timeouts
+            s.fence_timeouts,
+            s.damage_events
         );
         self.stats_since = now;
     }
@@ -607,6 +742,9 @@ impl Compositor {
             let mut wake = |d: Duration| timeout = Some(timeout.map_or(d, |t| t.min(d)));
             self.zoom.advance(now);
             if let Some(d) = self.track_pointer(now)? {
+                wake(d);
+            }
+            if let Some(d) = self.expire_undrawn(now)? {
                 wake(d);
             }
             if let Some(d) = self.update_redirection(now)? {

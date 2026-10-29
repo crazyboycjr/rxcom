@@ -1,7 +1,9 @@
 //! The top-level windows (children of the root) in stacking order, with the X
 //! resources the compositor holds for each.
 
+use std::time::Instant;
 use x11rb::connection::Connection;
+use x11rb::protocol::damage::ConnectionExt as _;
 use x11rb::protocol::render::ConnectionExt as _;
 use x11rb::protocol::xproto::{ConnectionExt as _, Rectangle, Window};
 
@@ -23,6 +25,39 @@ impl Geometry {
     }
 }
 
+#[derive(Debug)]
+pub enum Undrawn {
+    /// Just mapped. The X server's own damage comes first, then its request
+    /// to the client to draw (Expose); waits that long at most.
+    Mapped(Instant),
+    /// Asked to draw: damage within the window is the client's. A deadline
+    /// when it may have drawn before rxcom could see it.
+    Asked(Option<Instant>),
+    /// The parts drawn so far: done when they cover the window, or at the
+    /// deadline.
+    Drawing(Vec<Rectangle>, Instant),
+}
+
+/// Whether `parts` together cover the rectangle `width` x `height` at the
+/// origin: every band between two of their top or bottom edges is spanned.
+pub fn covers(parts: &[Rectangle], width: u16, height: u16) -> bool {
+    let rows = |r: &Rectangle| (i32::from(r.y), i32::from(r.y) + i32::from(r.height));
+    let mut edges: Vec<i32> = parts.iter().flat_map(|r| <[i32; 2]>::from(rows(r))).collect();
+    edges.extend([0, i32::from(height)]);
+    edges.sort_unstable();
+    edges.dedup();
+    edges.windows(2).filter(|e| e[0] >= 0 && e[1] <= i32::from(height)).all(|e| {
+        let mut cols: Vec<(i32, i32)> = parts
+            .iter()
+            .filter(|r| rows(r).0 <= e[0] && rows(r).1 >= e[1])
+            .map(|r| (i32::from(r.x), i32::from(r.x) + i32::from(r.width)))
+            .collect();
+        cols.sort_unstable();
+        let reach = cols.iter().try_fold(0, |reach, &(start, end)| (start <= reach).then(|| reach.max(end)));
+        reach.is_some_and(|reach| reach >= i32::from(width))
+    })
+}
+
 #[derive(Debug, Default)]
 pub struct Win {
     pub id: Window,
@@ -41,6 +76,18 @@ pub struct Win {
     pub alpha: bool,
     /// The picture no longer matches the window (just mapped, resized or reshaped).
     pub stale: bool,
+    /// The client has not drawn into the window's new pixmap yet. After a map
+    /// or resize the X server fills it with a copy of the screen, which is
+    /// long out of date when Vulkan flips.
+    pub undrawn: Option<Undrawn>,
+    /// Damage reported operation by operation, so the X server's own reports
+    /// for a new pixmap never merge with the client's drawing. It exists only
+    /// while the window waits for one: from its unmap or resize until the
+    /// client has drawn, as one report per drawing request costs too much.
+    pub witness: Option<u32>,
+    /// What shows meanwhile: a copy of the scene where the window lies, as a
+    /// pixmap and a picture on it.
+    pub stand_in: Option<(u32, u32)>,
 }
 
 impl Win {
@@ -48,14 +95,35 @@ impl Win {
         self.mapped && !self.input_only && !self.ignored
     }
 
-    /// Frees the window's pixmap and picture; the damage object stays.
+    /// Frees the window's pixmap and picture, and its stand-in; the damage
+    /// objects stay.
     pub fn release(&mut self, c: &impl Connection) {
+        self.drop_stand_in(c);
         if let Some(p) = self.picture.take() {
             let _ = c.render_free_picture(p);
         }
         if let Some(p) = self.pixmap.take() {
             let _ = c.free_pixmap(p);
         }
+    }
+
+    pub fn drop_stand_in(&mut self, c: &impl Connection) {
+        if let Some((pixmap, picture)) = self.stand_in.take() {
+            let _ = c.render_free_picture(picture);
+            let _ = c.free_pixmap(pixmap);
+        }
+    }
+
+    /// The client has drawn, or rxcom stops waiting: the window shows its own
+    /// pixels again. Returns the area to repaint when it showed a stand-in.
+    pub fn drawn(&mut self, c: &impl Connection) -> Option<Rectangle> {
+        self.undrawn = None;
+        if let Some(d) = self.witness.take() {
+            let _ = c.damage_destroy(d);
+        }
+        let had = self.stand_in.is_some();
+        self.drop_stand_in(c);
+        had.then(|| self.geom.outer())
     }
 }
 
@@ -155,6 +223,20 @@ mod tests {
         assert_eq!(order(&l), [2, 3, 1, 4]);
         assert!(!l.restack(2, 99));
         assert_eq!(order(&l), [3, 1, 4, 2]);
+    }
+
+    #[test]
+    fn coverage() {
+        let r = |x, y, width, height| Rectangle { x, y, width, height };
+        assert!(covers(&[r(0, 0, 10, 10)], 10, 10));
+        assert!(!covers(&[], 10, 10));
+        // Bands drawn one by one, out of order and overlapping.
+        assert!(covers(&[r(0, 6, 10, 4), r(0, 0, 10, 3), r(0, 2, 10, 5)], 10, 10));
+        assert!(!covers(&[r(0, 6, 10, 4), r(0, 0, 10, 3)], 10, 10));
+        // Side by side, with a one-pixel gap, and reaching past the window.
+        assert!(covers(&[r(0, 0, 4, 10), r(4, 0, 6, 10)], 10, 10));
+        assert!(!covers(&[r(0, 0, 4, 10), r(5, 0, 5, 10)], 10, 10));
+        assert!(covers(&[r(-2, -2, 20, 20)], 10, 10));
     }
 
     #[test]

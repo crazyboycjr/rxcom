@@ -290,9 +290,9 @@ impl X {
         (!is_window).then_some(p)
     }
 
-    pub fn create_damage(&self, w: Window) -> Result<u32> {
+    pub fn create_damage(&self, w: Window, level: damage::ReportLevel) -> Result<u32> {
         let d = self.conn.generate_id()?;
-        self.conn.damage_create(d, w, damage::ReportLevel::NON_EMPTY)?;
+        self.conn.damage_create(d, w, level)?;
         Ok(d)
     }
 

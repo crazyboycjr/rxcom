@@ -4,20 +4,33 @@
 //!   argbwin [--geometry WxH+X+Y] [--depth 32|24] [--color AARRGGBB]
 //!           [--pattern solid|gradient|quadrants] [--animate] [--name NAME]
 //!           [--override-redirect] [--border N] [--blink]
+//!           [--no-background] [--delay MS] [--band-delay MS]
+//!   argbwin --overlay [--color AARRGGBB]
 //!
 //! Colours are premultiplied ARGB. `gradient` ramps alpha from 0 at the left to
 //! the colour's alpha at the right; `quadrants` paints four opaque colours;
 //! `--animate` moves an opaque bar to produce damage every 50 ms; `--blink`
 //! switches the colour of the X border (`--border`, green at first) between
 //! green and magenta every 50 ms, the way a window manager marks focus.
+//! `--no-background` leaves the window's background None, so the X server
+//! paints nothing when it is mapped or resized, and `--delay` waits that long
+//! after each exposure before drawing: a slow client such as a software-rendered
+//! Electron app. The window is drawn in bands of rows, one request each, and
+//! `--band-delay` pauses between them.
+//!
+//! `--overlay` instead fills the composite overlay window with the colour and
+//! exits. That changes the X server's screen pixmap only, as a presenter that
+//! flips leaves it out of date, and the X server copies from it into the pixmap
+//! of every window it maps or resizes.
 
 use anyhow::{Context, Result, bail};
 use std::time::{Duration, Instant};
 use x11rb::connection::Connection;
 use x11rb::protocol::Event;
+use x11rb::protocol::composite::ConnectionExt as _;
 use x11rb::protocol::xproto::{
     AtomEnum, ChangeWindowAttributesAux, ColormapAlloc, ConnectionExt as _, CreateGCAux, CreateWindowAux, EventMask,
-    ImageFormat, PropMode, VisualClass, WindowClass,
+    ImageFormat, PropMode, Rectangle, VisualClass, WindowClass,
 };
 use x11rb::wrapper::ConnectionExt as _;
 
@@ -34,6 +47,10 @@ struct Args {
     override_redirect: bool,
     border: u16,
     blink: bool,
+    background: bool,
+    delay: Duration,
+    band_delay: Duration,
+    overlay: bool,
 }
 
 fn parse() -> Result<Args> {
@@ -50,6 +67,10 @@ fn parse() -> Result<Args> {
         override_redirect: false,
         border: 0,
         blink: false,
+        background: true,
+        delay: Duration::ZERO,
+        band_delay: Duration::ZERO,
+        overlay: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
@@ -70,6 +91,10 @@ fn parse() -> Result<Args> {
             "--override-redirect" => a.override_redirect = true,
             "--border" => a.border = v()?.parse()?,
             "--blink" => a.blink = true,
+            "--no-background" => a.background = false,
+            "--delay" => a.delay = Duration::from_millis(v()?.parse()?),
+            "--band-delay" => a.band_delay = Duration::from_millis(v()?.parse()?),
+            "--overlay" => a.overlay = true,
             _ => bail!("unknown option {k}"),
         }
     }
@@ -104,6 +129,16 @@ fn main() -> Result<()> {
     let a = parse()?;
     let (conn, screen) = x11rb::connect(None)?;
     let s = &conn.setup().roots[screen];
+    if a.overlay {
+        let overlay = conn.composite_get_overlay_window(s.root)?.reply()?.overlay_win;
+        let gc = conn.generate_id()?;
+        conn.create_gc(gc, overlay, &CreateGCAux::new().foreground(a.color & 0xffffff))?;
+        let all = Rectangle { x: 0, y: 0, width: s.width_in_pixels, height: s.height_in_pixels };
+        conn.poly_fill_rectangle(overlay, gc, &[all])?;
+        conn.composite_release_overlay_window(s.root)?;
+        conn.get_input_focus()?.reply()?;
+        return Ok(());
+    }
     let visual = s
         .allowed_depths
         .iter()
@@ -115,24 +150,15 @@ fn main() -> Result<()> {
     let cmap = conn.generate_id()?;
     conn.create_colormap(ColormapAlloc::NONE, cmap, s.root, visual)?;
     let win = conn.generate_id()?;
-    conn.create_window(
-        a.depth,
-        win,
-        s.root,
-        a.x,
-        a.y,
-        a.w,
-        a.h,
-        a.border,
-        WindowClass::INPUT_OUTPUT,
-        visual,
-        &CreateWindowAux::new()
-            .background_pixel(0)
-            .border_pixel(BORDER[0])
-            .colormap(cmap)
-            .override_redirect(a.override_redirect as u32)
-            .event_mask(EventMask::EXPOSURE | EventMask::STRUCTURE_NOTIFY),
-    )?;
+    let mut aux = CreateWindowAux::new()
+        .border_pixel(BORDER[0])
+        .colormap(cmap)
+        .override_redirect(a.override_redirect as u32)
+        .event_mask(EventMask::EXPOSURE | EventMask::STRUCTURE_NOTIFY);
+    if a.background {
+        aux = aux.background_pixel(0);
+    }
+    conn.create_window(a.depth, win, s.root, a.x, a.y, a.w, a.h, a.border, WindowClass::INPUT_OUTPUT, visual, &aux)?;
     conn.change_property8(PropMode::REPLACE, win, AtomEnum::WM_NAME, AtomEnum::STRING, a.name.as_bytes())?;
     let gc = conn.generate_id()?;
     conn.create_gc(gc, win, &CreateGCAux::new())?;
@@ -161,6 +187,10 @@ fn main() -> Result<()> {
             }
             conn.put_image(ImageFormat::Z_PIXMAP, win, gc, w, rows, 0, y0 as i16, 0, a.depth, &data)?;
             y0 += rows;
+            if !a.band_delay.is_zero() && y0 < h {
+                conn.flush()?;
+                std::thread::sleep(a.band_delay);
+            }
         }
         conn.flush()?;
         Ok(())
@@ -168,13 +198,20 @@ fn main() -> Result<()> {
 
     let start = Instant::now();
     let mut next = start;
+    let mut exposed: Option<Instant> = None;
     loop {
         while let Some(ev) = conn.poll_for_event()? {
             match ev {
-                Event::Expose(e) if e.count == 0 => draw(size, None)?,
+                Event::Expose(e) if e.count == 0 => {
+                    exposed.get_or_insert(Instant::now());
+                }
                 Event::ConfigureNotify(e) => size = (e.width, e.height),
                 _ => {}
             }
+        }
+        if exposed.is_some_and(|t| t.elapsed() >= a.delay) {
+            exposed = None;
+            draw(size, None)?;
         }
         if (a.animate || a.blink) && Instant::now() >= next {
             let t = start.elapsed().as_millis() as u32 / 50;

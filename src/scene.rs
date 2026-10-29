@@ -12,7 +12,7 @@ use x11rb::connection::Connection;
 use x11rb::protocol::damage::ConnectionExt as _;
 use x11rb::protocol::render::{self, ConnectionExt as _, PictOp, Transform};
 use x11rb::protocol::xfixes::ConnectionExt as _;
-use x11rb::protocol::xproto::{ConnectionExt as _, Rectangle};
+use x11rb::protocol::xproto::{ConnectionExt as _, CreateGCAux, Rectangle};
 
 pub struct Scene {
     pub pixmap: u32,
@@ -25,7 +25,11 @@ pub struct Scene {
     /// The part of the screen still to redraw.
     damage: u32,
     scratch: u32,
+    /// Copies parts of the scene into stand-ins.
+    gc: u32,
     pub dirty: bool,
+    /// Painted in full at least once, so its contents can be copied.
+    complete: bool,
     /// The zoom view `source` is transformed for.
     transform: Option<View>,
 }
@@ -48,9 +52,11 @@ impl Scene {
         };
         let format = x.root_format();
         let full = Rectangle { x: 0, y: 0, width: x.width, height: x.height };
-        let (damage, scratch) = (c.generate_id()?, c.generate_id()?);
+        let (damage, scratch, gc) = (c.generate_id()?, c.generate_id()?, c.generate_id()?);
         c.xfixes_create_region(damage, &[full])?;
         c.xfixes_create_region(scratch, &[])?;
+        c.create_gc(gc, pixmap, &CreateGCAux::new().graphics_exposures(0))?;
+        log::debug!("scene pixmap 0x{pixmap:x}");
         Ok(Scene {
             pixmap,
             width: x.width,
@@ -59,7 +65,9 @@ impl Scene {
             source: x.create_picture(pixmap, format)?,
             damage,
             scratch,
+            gc,
             dirty: true,
+            complete: false,
             transform: None,
         })
     }
@@ -70,6 +78,7 @@ impl Scene {
         let _ = c.render_free_picture(self.source);
         let _ = c.xfixes_destroy_region(self.damage);
         let _ = c.xfixes_destroy_region(self.scratch);
+        let _ = c.free_gc(self.gc);
         let _ = c.free_pixmap(self.pixmap);
     }
 
@@ -82,6 +91,19 @@ impl Scene {
         c.xfixes_union_region(self.damage, self.scratch, self.damage)?;
         self.dirty = true;
         Ok(())
+    }
+
+    /// A copy of what the scene shows at `r`, as a pixmap and a picture, or None
+    /// while the scene has never been painted in full.
+    pub fn snapshot(&self, x: &X, r: Rectangle) -> Result<Option<(u32, u32)>> {
+        if !self.complete {
+            return Ok(None);
+        }
+        let c = &x.conn;
+        let pixmap = c.generate_id()?;
+        c.create_pixmap(c.setup().roots[x.screen].root_depth, pixmap, x.root, r.width, r.height)?;
+        c.copy_area(self.pixmap, pixmap, self.gc, r.x, r.y, 0, 0, r.width, r.height)?;
+        Ok(Some((pixmap, x.create_picture(pixmap, x.root_format())?)))
     }
 
     pub fn add_rect(&mut self, x: &X, r: Rectangle) -> Result<()> {
@@ -98,18 +120,22 @@ impl Scene {
     }
 
     /// Redraws the damaged part of the scene: the background, then `wins` bottom
-    /// to top. The damage stays until `clear_damage`, so a presenter can copy
-    /// just that part.
+    /// to top, each by its stand-in while it has one. The damage stays until
+    /// `clear_damage`, so a presenter can copy just that part.
     pub fn paint<'a>(&mut self, x: &X, bg: &Background, wins: impl Iterator<Item = &'a Win>) -> Result<()> {
         let c = &x.conn;
         c.xfixes_set_picture_clip_region(self.target, self.damage, 0, 0)?;
         c.render_composite(PictOp::SRC, bg.picture, NONE, self.target, 0, 0, 0, 0, 0, 0, self.width, self.height)?;
         for w in wins.filter(|w| w.drawable()) {
-            let Some(picture) = w.picture else { continue };
+            let (op, picture) = match (w.stand_in, w.picture) {
+                (Some((_, stand_in)), _) => (PictOp::SRC, stand_in),
+                (None, Some(p)) => (if w.alpha { PictOp::OVER } else { PictOp::SRC }, p),
+                (None, None) => continue,
+            };
             let r = w.geom.outer();
-            let op = if w.alpha { PictOp::OVER } else { PictOp::SRC };
             c.render_composite(op, picture, NONE, self.target, 0, 0, 0, 0, r.x, r.y, r.width, r.height)?;
         }
+        self.complete = true;
         Ok(())
     }
 

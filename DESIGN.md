@@ -609,7 +609,45 @@ In the other direction, X must not write the scene while Vulkan reads it. Before
 composing, rxcom checks without blocking that the GPU has finished the previous
 frame, through a timeline semaphore; that takes a fraction of a millisecond.
 
-### 8.4 Presentation and pacing
+### 8.4 Windows their clients have not drawn yet
+
+When the X server maps or resizes a redirected window, it fills the window's new
+pixmap with a copy of the screen pixmap there (`compNewPixmap`). Under the X
+presenter that is the last composed frame, so such a window looks like what was
+on screen before. When NVIDIA flips the Vulkan swapchain (the composition
+pipeline off), nothing updates the screen pixmap: it keeps the frame X last drew,
+such as the desktop when rxcom started, or black after a VT switch. The first
+trial on the real display (10-29) showed that for an instant whenever a window
+appeared: another desktop's wallpaper and terminals in the slow, software-drawn
+Claude app, old text in a scratchpad. A readback there confirmed it: new window
+pixmaps copy whatever the screen pixmap holds, and with the composition pipeline
+on, the Vulkan frames do reach the screen pixmap, so only flips leave it old.
+
+So until its client has drawn, rxcom draws a window from a stand-in: a copy of
+the scene taken where the window lies when its new pixmap is bound, which is
+what the X presenter's screen would show. The X server's own damage for a new
+pixmap says nothing about the client: it reports the whole window when mapping
+it (`compSetRedirectBorderClip`) and repaints the border, reported as its
+bounding box. rxcom selects Expose on top-level windows as well, and the server
+sends it before the client can draw, so damage after it comes from the client's
+requests. NonEmpty damage can merge the client's first drawing into the server's
+report, so a second damage object reports each drawing request's rectangles in
+order (RawRectangles) while a window waits; rectangles within the window after
+the Expose are the client's, and the wait ends when they cover the window. A GL
+swap or a whole image does at once. A drawing in parts takes several, and may be
+the rest of one begun before the window was mapped again, so its first part
+proves nothing; it gets 500 ms at most. Such reports cost too much to keep for
+every window (a terminal printing `yes` made 67,000 to 80,000 a second and
+tripled the X server's CPU), so the second object lives only from a window's
+unmap until its client has drawn after the next map. Where rxcom cannot watch
+from before the server's damage, it asks the client to draw again with ClearArea
+and exposures: a window mapped as it was created (a menu), and a resized window
+whose client has not drawn within 50 ms, since the client may have redrawn before
+rxcom heard of the resize; a slow client's pending drawing absorbs the request. A
+window whose top level gets no Expose (a child covers it) shows its own pixels
+after 50 ms.
+
+### 8.5 Presentation and pacing
 
 - **FIFO_LATEST_READY.** A frame is composed and queued as soon as damage
   arrives, up to the frame limit (by default the fastest lit monitor's refresh
@@ -648,7 +686,7 @@ frame, through a timeline semaphore; that takes a fraction of a millisecond.
   windows and unmaps the overlay, as picom does. It redirects again as soon as
   that stops being true, or when the zoom starts.
 
-### 8.5 Costs at 4K and 240 Hz
+### 8.6 Costs at 4K and 240 Hz
 
 - **X server:** the composition requests, about 0.25 ms of CPU per frame for four
   windows redrawn in full on glamor, less when only part of the screen changes,
@@ -663,7 +701,7 @@ frame, through a timeline semaphore; that takes a fraction of a millisecond.
 - **Idle:** no frames and no CPU; while zoomed and still, a pointer query every
   100 ms.
 
-### 8.6 Rejected
+### 8.7 Rejected
 
 - **Per-window DRI3 import**, the prototype's route: the heap buffers pinned in
   Xorg and 8 ms per map or resize (2.1).
@@ -680,7 +718,7 @@ frame, through a timeline semaphore; that takes a fraction of a millisecond.
   fences to dma-bufs (2.2).
 - **MAILBOX** does not exist on this surface; **IMMEDIATE** tears.
 
-### 8.7 What only the real display can answer
+### 8.8 What only the real display can answer
 
 - Whether NVIDIA's X driver accepts PixmapFromBuffers and renders into such a
   pixmap at full speed; otherwise the BuffersFromPixmap route, otherwise the X
@@ -694,11 +732,13 @@ frame, through a timeline semaphore; that takes a fraction of a millisecond.
   wakeup, and how long the polled waits are at 240 Hz.
 - Flips, pacing at 240 Hz, VT round trips, the monitor going away, and games
   unredirected.
+- That windows no longer show old frames when they appear or change size while
+  the Vulkan swapchain flips (8.4).
 
 `rxcom -v` logs the route, the fence waits and per-frame timings, so the user's
 first trial answers these.
 
-### 8.8 As built (10-29)
+### 8.9 As built (10-29)
 
 | File | Lines | Role |
 | --- | ---: | --- |
