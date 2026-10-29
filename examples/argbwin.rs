@@ -2,16 +2,18 @@
 //! pixels, so compositor output can be checked exactly.
 //!
 //!   argbwin [--geometry WxH+X+Y] [--depth 32|24] [--color AARRGGBB]
-//!           [--pattern solid|gradient|quadrants] [--animate] [--name NAME]
+//!           [--pattern solid|gradient|quadrants] [--animate] [--fps N] [--name NAME]
 //!           [--override-redirect] [--border N] [--blink]
 //!           [--no-background] [--delay MS] [--band-delay MS]
 //!   argbwin --overlay [--color AARRGGBB]
 //!
 //! Colours are premultiplied ARGB. `gradient` ramps alpha from 0 at the left to
 //! the colour's alpha at the right; `quadrants` paints four opaque colours;
-//! `--animate` moves an opaque bar to produce damage every 50 ms; `--blink`
-//! switches the colour of the X border (`--border`, green at first) between
-//! green and magenta every 50 ms, the way a window manager marks focus.
+//! `--animate` redraws the window with an opaque bar moving across it, `--fps`
+//! times a second (default 20); `--blink` switches the colour of the X border
+//! (`--border`, green at first) between green and magenta as often, the way a
+//! window manager marks focus. A solid window is drawn with fills, which cost
+//! the X server little, so an animated one stands for a GPU-drawn client.
 //! `--no-background` leaves the window's background None, so the X server
 //! paints nothing when it is mapped or resized, and `--delay` waits that long
 //! after each exposure before drawing: a slow client such as a software-rendered
@@ -29,8 +31,8 @@ use x11rb::connection::Connection;
 use x11rb::protocol::Event;
 use x11rb::protocol::composite::ConnectionExt as _;
 use x11rb::protocol::xproto::{
-    AtomEnum, ChangeWindowAttributesAux, ColormapAlloc, ConnectionExt as _, CreateGCAux, CreateWindowAux, EventMask,
-    ImageFormat, PropMode, Rectangle, VisualClass, WindowClass,
+    AtomEnum, ChangeGCAux, ChangeWindowAttributesAux, ColormapAlloc, ConnectionExt as _, CreateGCAux, CreateWindowAux,
+    EventMask, ImageFormat, PropMode, Rectangle, VisualClass, WindowClass,
 };
 use x11rb::wrapper::ConnectionExt as _;
 
@@ -43,6 +45,7 @@ struct Args {
     color: u32,
     pattern: String,
     animate: bool,
+    fps: f64,
     name: String,
     override_redirect: bool,
     border: u16,
@@ -63,6 +66,7 @@ fn parse() -> Result<Args> {
         color: 0x80800000,
         pattern: "solid".into(),
         animate: false,
+        fps: 20.0,
         name: "argbwin".into(),
         override_redirect: false,
         border: 0,
@@ -87,6 +91,7 @@ fn parse() -> Result<Args> {
             "--color" => a.color = u32::from_str_radix(&v()?, 16)?,
             "--pattern" => a.pattern = v()?,
             "--animate" => a.animate = true,
+            "--fps" => a.fps = v()?.parse::<f64>()?.max(1.0),
             "--name" => a.name = v()?,
             "--override-redirect" => a.override_redirect = true,
             "--border" => a.border = v()?.parse()?,
@@ -165,9 +170,23 @@ fn main() -> Result<()> {
     conn.map_window(win)?;
     conn.flush()?;
 
+    const BAR: u32 = 0xffffff00;
     let mut size = (a.w, a.h);
     let draw = |size: (u16, u16), bar: Option<u16>| -> Result<()> {
         let (w, h) = size;
+        if a.pattern == "solid" && a.band_delay.is_zero() {
+            let fill = |color: u32, x: u16, width: u16| -> Result<()> {
+                conn.change_gc(gc, &ChangeGCAux::new().foreground(color))?;
+                conn.poly_fill_rectangle(win, gc, &[Rectangle { x: x as i16, y: 0, width, height: h }])?;
+                Ok(())
+            };
+            fill(a.color, 0, w)?;
+            if let Some(b) = bar {
+                fill(BAR, b, 20)?;
+            }
+            conn.flush()?;
+            return Ok(());
+        }
         let rows_per_req = (60000 / (w as usize * 4)).max(1) as u16;
         let mut y0 = 0u16;
         while y0 < h {
@@ -180,7 +199,7 @@ fn main() -> Result<()> {
                         && x >= b
                         && x < b + 20
                     {
-                        p = 0xff000000 | 0x00ffff00;
+                        p = BAR;
                     }
                     data.extend_from_slice(&p.to_le_bytes());
                 }
@@ -214,18 +233,20 @@ fn main() -> Result<()> {
             draw(size, None)?;
         }
         if (a.animate || a.blink) && Instant::now() >= next {
-            let t = start.elapsed().as_millis() as u32 / 50;
+            let ms = start.elapsed().as_millis() as u32;
             if a.animate {
+                // 160 pixels a second, whatever the frame rate.
                 let span = size.0.saturating_sub(20).max(1) as u32;
-                draw(size, Some((t * 8 % span) as u16))?;
+                draw(size, Some((ms * 8 / 50 % span) as u16))?;
             }
             if a.blink {
-                let aux = ChangeWindowAttributesAux::new().border_pixel(BORDER[t as usize % 2]);
+                let aux = ChangeWindowAttributesAux::new().border_pixel(BORDER[(ms / 50) as usize % 2]);
                 conn.change_window_attributes(win, &aux)?;
                 conn.flush()?;
             }
-            next += Duration::from_millis(50);
+            next += Duration::from_secs_f64(1.0 / a.fps);
         }
-        std::thread::sleep(Duration::from_millis(5));
+        let due = if a.animate || a.blink { next.saturating_duration_since(Instant::now()) } else { Duration::MAX };
+        std::thread::sleep(due.min(Duration::from_millis(5)));
     }
 }

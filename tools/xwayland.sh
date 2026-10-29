@@ -2,7 +2,8 @@
 # A nested X server with DRI3, for testing rxcom's dma-buf path without the real
 # display: a headless mutter (private D-Bus session, Wayland socket
 # "rxcom-test", no Xwayland of its own) and a rootful Xwayland on that socket.
-#   tools/xwayland.sh start [N] [WxH]   display :N (default 26), WxH (default 1920x1080)
+#   tools/xwayland.sh start [N] [WxH[@R]]   display :N (default 26), WxH (default 1920x1080),
+#                                           R Hz (default mutter's 60)
 #   tools/xwayland.sh stop [N]
 # The Wayland socket name is passed to Xwayland only; nothing exports it.
 set -eu
@@ -29,7 +30,7 @@ start)
 		--wayland-display=$sock --virtual-monitor $size" >"$dir/logs/mutter$n.log" 2>&1 &
 	for _ in $(seq 100); do [ -S "$XDG_RUNTIME_DIR/$sock" ] && break; sleep 0.1; done
 	[ -S "$XDG_RUNTIME_DIR/$sock" ] || { echo "mutter did not come up; see $dir/logs/mutter$n.log" >&2; exit 1; }
-	WAYLAND_DISPLAY=$sock Xwayland ":$n" -geometry $size -noreset -nolisten tcp \
+	WAYLAND_DISPLAY=$sock Xwayland ":$n" -geometry "${size%@*}" -noreset -nolisten tcp \
 		>"$dir/logs/xwayland$n.log" 2>&1 &
 	echo $! >"$xpid"
 	for _ in $(seq 100); do
