@@ -1,2 +1,5 @@
 /target
 /.claude/worktrees/
+/packaging/arch/src/
+/packaging/arch/pkg/
+/packaging/arch/*.pkg.tar.*
