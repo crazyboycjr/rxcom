@@ -611,11 +611,13 @@ frame, through a timeline semaphore; that takes a fraction of a millisecond.
 ### 8.4 Presentation and pacing
 
 - **FIFO_LATEST_READY.** A frame is composed and queued as soon as damage
-  arrives, up to the frame limit (240 by default), and at each vblank the
-  presentation engine shows the newest ready one. Acquire uses a zero timeout;
-  when no image is free, damage merges into the next frame and rxcom looks again
-  1 ms later (20 ms after 50 ms without one). FIFO is the fallback where the mode
-  is missing. present_wait is not needed for this and is not used.
+  arrives, up to the frame limit (by default the fastest lit monitor's refresh
+  rate, read from RandR and updated when the monitors change), and at each
+  vblank the presentation engine shows the newest ready one. Acquire uses a
+  zero timeout; when no image is free, damage merges into the next frame and
+  rxcom looks again 1 ms later (20 ms after 50 ms without one). FIFO is the
+  fallback where the mode is missing. present_wait is not needed for this and
+  is not used.
 - **Present fences** (swapchain_maintenance1) tell when the presentation engine
   is done with a present, so the swapchain is never destroyed while one is
   queued; the validation layers flagged exactly that without them.

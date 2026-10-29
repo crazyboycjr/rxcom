@@ -9,6 +9,7 @@ use x11rb::connection::{Connection, RequestConnection};
 use x11rb::protocol::composite::{self, ConnectionExt as _};
 use x11rb::protocol::damage::{self, ConnectionExt as _};
 use x11rb::protocol::dri3::{self, ConnectionExt as _};
+use x11rb::protocol::randr::{self, ConnectionExt as _};
 use x11rb::protocol::render::{self, ConnectionExt as _, PictType};
 use x11rb::protocol::shape::{self, ConnectionExt as _};
 use x11rb::protocol::sync::ConnectionExt as _;
@@ -51,6 +52,8 @@ pub struct X {
     pub dri3: bool,
     /// XInput 2.2, for raw pointer motion.
     pub xi2: bool,
+    /// RandR 1.3, for the monitors' refresh rates.
+    pub randr: bool,
     /// Owns the _NET_WM_CM_Sn selection.
     pub owner: Window,
     pub overlay: Window,
@@ -83,6 +86,8 @@ impl X {
             && conn.dri3_query_version(1, 2)?.reply().is_ok_and(|v| (v.major_version, v.minor_version) >= (1, 2));
         let xi2 = conn.extension_information(xinput::X11_EXTENSION_NAME)?.is_some()
             && conn.xinput_xi_query_version(2, 2)?.reply().is_ok();
+        let randr = conn.extension_information(randr::X11_EXTENSION_NAME)?.is_some()
+            && conn.randr_query_version(1, 3)?.reply().is_ok_and(|v| (v.major_version, v.minor_version) >= (1, 3));
         conn.sync_initialize(3, 1)?.reply().context("no SYNC extension")?;
         // The X server's scheduler then serves rxcom's requests ahead of busy clients.
         conn.sync_set_priority(x11rb::NONE, 10)?;
@@ -131,6 +136,7 @@ impl X {
             argb32,
             dri3,
             xi2,
+            randr,
             owner: x11rb::NONE,
             overlay: x11rb::NONE,
         })
@@ -190,6 +196,9 @@ impl X {
         )?
         .check()
         .context("cannot select SubstructureNotify on the root")?;
+        if self.randr {
+            c.randr_select_input(self.root, randr::NotifyMask::CRTC_CHANGE)?;
+        }
         c.flush()?;
         Ok(())
     }
@@ -290,6 +299,35 @@ impl X {
     pub fn pointer(&self) -> Option<[i16; 2]> {
         let r = self.conn.query_pointer(self.root).ok()?.reply().ok()?;
         Some([r.root_x, r.root_y])
+    }
+
+    /// The refresh rate of the fastest lit monitor, if RandR reports one.
+    pub fn max_refresh(&self) -> Option<f64> {
+        if !self.randr {
+            return None;
+        }
+        let res = self.conn.randr_get_screen_resources_current(self.root).ok()?.reply().ok()?;
+        let cookies: Vec<_> = res
+            .crtcs
+            .iter()
+            .filter_map(|&crtc| self.conn.randr_get_crtc_info(crtc, res.config_timestamp).ok())
+            .collect();
+        cookies
+            .into_iter()
+            .filter_map(|c| c.reply().ok())
+            .filter_map(|crtc| res.modes.iter().find(|m| m.id == crtc.mode))
+            .map(|m| {
+                let mut lines = f64::from(m.vtotal);
+                if m.mode_flags.contains(randr::ModeFlag::DOUBLE_SCAN) {
+                    lines *= 2.0;
+                }
+                if m.mode_flags.contains(randr::ModeFlag::INTERLACE) {
+                    lines /= 2.0;
+                }
+                f64::from(m.dot_clock) / (f64::from(m.htotal) * lines)
+            })
+            .filter(|hz| hz.is_finite() && *hz > 0.0)
+            .reduce(f64::max)
     }
 
     /// The VT the X server runs on, which Xorg announces on the root window.

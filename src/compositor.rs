@@ -30,7 +30,8 @@ pub struct Options {
     /// Unredirect a full-screen opaque window after this long; None: never.
     pub unredirect_delay: Option<Duration>,
     pub linear: bool,
-    pub max_fps: f64,
+    /// None: the refresh rate of the fastest lit monitor.
+    pub max_fps: Option<f64>,
     pub background: u32,
 }
 
@@ -90,6 +91,7 @@ pub struct Compositor {
     vt: Option<Vt>,
     quit: bool,
     last_frame: Option<Instant>,
+    max_fps: Option<f64>,
     min_interval: Duration,
     stats: Stats,
     stats_since: Instant,
@@ -100,6 +102,13 @@ fn pending_signal(sigfd: RawFd) -> Option<u32> {
     let mut info = [0u8; std::mem::size_of::<libc::signalfd_siginfo>()];
     let n = unsafe { libc::read(sigfd, info.as_mut_ptr().cast(), info.len()) };
     (n == info.len() as isize).then(|| u32::from_ne_bytes(info[..4].try_into().unwrap()))
+}
+
+/// The shortest time between frames: the user's limit, else the fastest lit
+/// monitor's refresh period, else 60 Hz's (a server without RandR monitors).
+fn frame_interval(x: &X, max_fps: Option<f64>) -> Duration {
+    let fps = max_fps.or_else(|| x.max_refresh()).unwrap_or(60.0);
+    Duration::from_secs_f64(1.0 / fps.max(1.0))
 }
 
 /// The Vulkan presenter and the scene pixmap it shares, or None when Vulkan
@@ -161,6 +170,7 @@ impl Compositor {
         };
         let now = Instant::now();
         let zoom = Zoom::new(x.root_cardinal(x.atoms.picom_zoom, AtomEnum::CARDINAL), now);
+        let min_interval = frame_interval(&x, opts.max_fps);
         let mut c = Compositor {
             vt: x.vt().and_then(Vt::open),
             x,
@@ -189,7 +199,8 @@ impl Compositor {
             unredirected: None,
             quit: false,
             last_frame: None,
-            min_interval: Duration::from_secs_f64(1.0 / opts.max_fps.max(1.0)),
+            max_fps: opts.max_fps,
+            min_interval,
             stats: Stats::default(),
             stats_since: now,
         };
@@ -200,7 +211,13 @@ impl Compositor {
         c.background.set(&c.x, c.x.root_pixmap())?;
         c.scene.add_all(&c.x)?;
         let vt = c.vt.as_ref().map(|_| format!(", watching VT {}", c.x.vt().unwrap_or(0))).unwrap_or_default();
-        log::info!("composing {} top-level windows on a {}x{} screen{vt}", c.wins.len(), c.x.width, c.x.height);
+        let fps = 1.0 / c.min_interval.as_secs_f64();
+        log::info!(
+            "composing {} top-level windows on a {}x{} screen, up to {fps:.0} fps{vt}",
+            c.wins.len(),
+            c.x.width,
+            c.x.height
+        );
         c.x.conn.flush()?;
         Ok(c)
     }
@@ -304,6 +321,13 @@ impl Compositor {
                     log::info!("screen resized to {}x{}", e.width, e.height);
                     (self.x.width, self.x.height) = (e.width, e.height);
                     self.rebuild_gpu("new screen size")?;
+                }
+            }
+            Event::RandrNotify(_) if self.max_fps.is_none() => {
+                let interval = frame_interval(&self.x, None);
+                if interval != self.min_interval {
+                    log::info!("monitors changed: up to {:.0} fps", 1.0 / interval.as_secs_f64());
+                    self.min_interval = interval;
                 }
             }
             Event::ConfigureNotify(e) => {

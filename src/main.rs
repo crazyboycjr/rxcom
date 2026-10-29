@@ -14,7 +14,8 @@ usage: rxcom [options]
                           (a game) after MS milliseconds (default 200)
   --no-unredirect         always composite
   --zoom-filter F         nearest (default) or linear
-  --max-fps N             frame rate limit (default 240)
+  --max-fps N             frame rate limit (default: the refresh rate of the
+                          fastest lit monitor)
   --background RRGGBB     colour where no wallpaper is set (default 303030)
   -v, -vv                 more logging (or RXCOM_LOG=debug)
   -h, --help
@@ -34,7 +35,7 @@ fn parse_args() -> Result<(Options, u8)> {
         vulkan: true,
         unredirect_delay: Some(Duration::from_millis(200)),
         linear: false,
-        max_fps: 240.0,
+        max_fps: None,
         background: 0x303030,
     };
     let mut verbose = 0;
@@ -55,7 +56,7 @@ fn parse_args() -> Result<(Options, u8)> {
                     f => bail!("--zoom-filter: {f} is neither nearest nor linear"),
                 }
             }
-            "--max-fps" => o.max_fps = value()?.parse().context("--max-fps")?,
+            "--max-fps" => o.max_fps = Some(value()?.parse().context("--max-fps")?),
             "--background" => {
                 let v = value()?;
                 o.background = u32::from_str_radix(v.trim_start_matches('#'), 16).context("--background RRGGBB")?;
