@@ -33,6 +33,8 @@ pub struct Options {
     pub linear: bool,
     /// None: the refresh rate of the fastest lit monitor.
     pub max_fps: Option<f64>,
+    /// None: FIFO_LATEST_READY where offered, else FIFO.
+    pub present_mode: Option<ash::vk::PresentModeKHR>,
     pub background: u32,
 }
 
@@ -49,6 +51,8 @@ const DRAW_WAIT: Duration = Duration::from_millis(50);
 /// How long a window waits for the rest once its client has drawn part of it.
 const DRAWING_LIMIT: Duration = Duration::from_millis(500);
 const STATS_EVERY: Duration = Duration::from_secs(10);
+/// A wait for a free swapchain image this long is logged.
+const NO_IMAGE_LOG: Duration = Duration::from_millis(200);
 
 #[derive(Default)]
 struct Stats {
@@ -99,6 +103,7 @@ pub struct Compositor {
     quit: bool,
     last_frame: Option<Instant>,
     max_fps: Option<f64>,
+    present_mode: Option<ash::vk::PresentModeKHR>,
     min_interval: Duration,
     stats: Stats,
     stats_since: Instant,
@@ -120,12 +125,12 @@ fn frame_interval(x: &X, max_fps: Option<f64>) -> Duration {
 
 /// The Vulkan presenter and the scene pixmap it shares, or None when Vulkan
 /// cannot present here and the X server will.
-fn try_gpu(x: &X, display: Option<&str>) -> (Option<Gpu>, Option<u32>) {
+fn try_gpu(x: &X, display: Option<&str>, mode: Option<ash::vk::PresentModeKHR>) -> (Option<Gpu>, Option<u32>) {
     if !x.dri3 {
         log::info!("no DRI3 1.2: the X server presents");
         return (None, None);
     }
-    match Gpu::new(x, display) {
+    match Gpu::new(x, display, mode) {
         Ok((gpu, pixmap)) => {
             log::info!("presenting with {}", gpu.route);
             (Some(gpu), Some(pixmap))
@@ -177,7 +182,8 @@ impl Compositor {
     pub fn new(opts: &Options) -> Result<Compositor> {
         let mut x = X::connect(opts.display.as_deref())?;
         x.become_compositor()?;
-        let (gpu, pixmap) = if opts.vulkan { try_gpu(&x, opts.display.as_deref()) } else { (None, None) };
+        let (gpu, pixmap) =
+            if opts.vulkan { try_gpu(&x, opts.display.as_deref(), opts.present_mode) } else { (None, None) };
         let setup = (|| -> Result<_> {
             Ok((Scene::new(&x, pixmap)?, x.create_picture(x.overlay, x.root_format())?, x.create_fence()?))
         })();
@@ -221,6 +227,7 @@ impl Compositor {
             quit: false,
             last_frame: None,
             max_fps: opts.max_fps,
+            present_mode: opts.present_mode,
             min_interval,
             stats: Stats::default(),
             stats_since: now,
@@ -251,7 +258,7 @@ impl Compositor {
         self.gpu = None;
         let pixmap = match (self.vulkan, self.gpu_failures < GPU_RETRIES) {
             (true, true) => {
-                let (gpu, pixmap) = try_gpu(&self.x, self.display.as_deref());
+                let (gpu, pixmap) = try_gpu(&self.x, self.display.as_deref(), self.present_mode);
                 self.gpu = gpu;
                 pixmap
             }
@@ -644,7 +651,12 @@ impl Compositor {
                 let late = now - since > Duration::from_millis(50);
                 return Ok(Some(Duration::from_millis(if late { 20 } else { 1 })));
             }
-            self.stats.no_image += self.blocked_since.take().is_some() as u32;
+            if let Some(since) = self.blocked_since.take() {
+                self.stats.no_image += 1;
+                if now - since >= NO_IMAGE_LOG {
+                    log::info!("no free swapchain image for {} ms", (now - since).as_millis());
+                }
+            }
         }
         for w in self.wins.iter_mut().filter(|w| w.drawable() && w.stale) {
             bind(&self.x, &self.scene, w)?;
@@ -745,6 +757,9 @@ impl Compositor {
                 wake(d);
             }
             if let Some(d) = self.expire_undrawn(now)? {
+                wake(d);
+            }
+            if let Some(d) = self.gpu.as_mut().and_then(|g| g.check_presents(now)) {
                 wake(d);
             }
             if let Some(d) = self.update_redirection(now)? {

@@ -30,6 +30,23 @@ const REQUIRED: [&CStr; 4] = [
 // present mode and feature struct.
 const LATEST_READY_EXT: &CStr = c"VK_EXT_present_mode_fifo_latest_ready";
 const FIFO_LATEST_READY: vk::PresentModeKHR = vk::PresentModeKHR::from_raw(1_000_361_000);
+const MODES: [(&str, vk::PresentModeKHR); 4] = [
+    ("latest", FIFO_LATEST_READY),
+    ("fifo", vk::PresentModeKHR::FIFO),
+    ("relaxed", vk::PresentModeKHR::FIFO_RELAXED),
+    ("immediate", vk::PresentModeKHR::IMMEDIATE),
+];
+/// A present the presentation engine holds longer than this is logged.
+const PRESENT_LIMIT: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// The present mode named on the command line.
+pub fn present_mode(name: &str) -> Option<vk::PresentModeKHR> {
+    MODES.iter().find(|m| m.0 == name).map(|m| m.1)
+}
+
+fn mode_name(mode: vk::PresentModeKHR) -> &'static str {
+    MODES.iter().find(|m| m.1 == mode).map_or("?", |m| m.0)
+}
 
 #[repr(C)]
 struct LatestReadyFeature {
@@ -88,6 +105,9 @@ struct Slot {
     /// present (VK_EXT_swapchain_maintenance1), so nothing it uses is destroyed
     /// or reused too early.
     presented: vk::Fence,
+    /// When that present was made while the fence is pending, and whether it
+    /// was logged as late.
+    present_at: Option<(std::time::Instant, bool)>,
 }
 
 pub struct Gpu {
@@ -146,7 +166,10 @@ fn surface(x: &X, display: Option<&str>) -> Result<Surface> {
 /// A Vulkan 1.3 device that presents to the overlay and shares dma-bufs, with
 /// what it offers beyond that: the foreign queue family, present fences and
 /// FIFO_LATEST_READY.
-fn create_device(s: &Surface) -> Result<(vk::PhysicalDevice, u32, ash::Device, bool, bool, vk::PresentModeKHR)> {
+fn create_device(
+    s: &Surface,
+    wanted: Option<vk::PresentModeKHR>,
+) -> Result<(vk::PhysicalDevice, u32, ash::Device, bool, bool, vk::PresentModeKHR)> {
     let mut best = None;
     for pd in unsafe { s.instance.enumerate_physical_devices()? } {
         let props = unsafe { s.instance.get_physical_device_properties(pd) };
@@ -206,7 +229,15 @@ fn create_device(s: &Surface) -> Result<(vk::PhysicalDevice, u32, ash::Device, b
     let queues = [vk::DeviceQueueCreateInfo::default().queue_family_index(family).queue_priorities(&prio)];
     let info = info.queue_create_infos(&queues).enabled_extension_names(&names);
     let device = unsafe { s.instance.create_device(pdev, &info, None) }.context("vkCreateDevice")?;
-    let mode = if latest_ready { FIFO_LATEST_READY } else { vk::PresentModeKHR::FIFO };
+    let best = if latest_ready { FIFO_LATEST_READY } else { vk::PresentModeKHR::FIFO };
+    let mode = match wanted {
+        Some(m) if m == best || (m != FIFO_LATEST_READY && modes.contains(&m)) => m,
+        Some(m) => {
+            log::warn!("present mode {} is not offered here; using {}", mode_name(m), mode_name(best));
+            best
+        }
+        None => best,
+    };
     Ok((pdev, family, device, foreign, present_fences, mode))
 }
 
@@ -247,9 +278,9 @@ fn view(d: &ash::Device, image: vk::Image, format: vk::Format) -> Result<vk::Ima
 impl Gpu {
     /// Sets Vulkan up to present on the overlay window and shares a screen-sized
     /// scene with the X server. Returns the presenter and the scene's pixmap.
-    pub fn new(x: &X, display: Option<&str>) -> Result<(Gpu, u32)> {
+    pub fn new(x: &X, display: Option<&str>, mode: Option<vk::PresentModeKHR>) -> Result<(Gpu, u32)> {
         let s = surface(x, display)?;
-        let (pdev, family, device, foreign, present_fences, mode) = create_device(&s)?;
+        let (pdev, family, device, foreign, present_fences, mode) = create_device(&s, mode)?;
         let formats = unsafe { s.fns.get_physical_device_surface_formats(pdev, s.surface) }.unwrap_or_default();
         let surface_format =
             formats.iter().find(|f| f.format == FORMAT).or(formats.first()).copied().unwrap_or_default();
@@ -506,7 +537,8 @@ impl Gpu {
                 let cmd = d.allocate_command_buffers(&alloc)?[0];
                 let acquired = d.create_semaphore(&vk::SemaphoreCreateInfo::default(), None)?;
                 let signalled = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
-                self.slots.push(Slot { cmd, acquired, value: 0, presented: d.create_fence(&signalled, None)? });
+                let presented = d.create_fence(&signalled, None)?;
+                self.slots.push(Slot { cmd, acquired, value: 0, presented, present_at: None });
             }
         }
         Ok(())
@@ -583,12 +615,13 @@ impl Gpu {
             sc.views.push(view(d, image, self.surface_format.format)?);
             sc.rendered.push(unsafe { d.create_semaphore(&vk::SemaphoreCreateInfo::default(), None)? });
         }
+        let vrr = std::env::var("__GL_VRR_ALLOWED").unwrap_or_default();
         log::info!(
-            "swapchain {}x{}, {} images, {}{}",
+            "swapchain {}x{}, {} images, present mode {}{}, __GL_VRR_ALLOWED={vrr}",
             sc.extent.width,
             sc.extent.height,
             sc.images.len(),
-            if self.mode == FIFO_LATEST_READY { "FIFO_LATEST_READY" } else { "FIFO" },
+            mode_name(self.mode),
             if self.present_fences { ", present fences" } else { "" }
         );
         self.swapchain = Some(sc);
@@ -631,6 +664,30 @@ impl Gpu {
     }
 
     /// Whether the GPU has finished reading the scene, so X may draw into it.
+    /// Logs presents the presentation engine holds longer than PRESENT_LIMIT,
+    /// and when it lets them go. Returns when to look again.
+    pub fn check_presents(&mut self, now: std::time::Instant) -> Option<std::time::Duration> {
+        let mut next: Option<std::time::Duration> = None;
+        for s in &mut self.slots {
+            let Some((at, late)) = s.present_at else { continue };
+            let age = now - at;
+            if unsafe { self.device.get_fence_status(s.presented) }.unwrap_or(true) {
+                if late {
+                    log::info!("present of frame {} done after {} ms", s.value, age.as_millis());
+                }
+                s.present_at = None;
+                continue;
+            }
+            if !late && age >= PRESENT_LIMIT {
+                log::info!("present of frame {} still pending after {} ms", s.value, age.as_millis());
+                s.present_at = Some((at, true));
+            }
+            let wait = if late { PRESENT_LIMIT / 4 } else { PRESENT_LIMIT - age };
+            next = Some(next.map_or(wait, |n| n.min(wait)));
+        }
+        next
+    }
+
     pub fn scene_free(&self) -> Result<bool> {
         Ok(unsafe { self.device.get_semaphore_counter_value(self.timeline)? } >= self.frame)
     }
@@ -738,6 +795,7 @@ impl Gpu {
             if self.present_fences {
                 d.reset_fences(&fence)?;
                 present = present.push_next(&mut fence_info);
+                self.slots[slot].present_at = Some((std::time::Instant::now(), false));
             }
             match self.swapchain_fn.queue_present(self.queue, &present) {
                 Ok(false) => {}

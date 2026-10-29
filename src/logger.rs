@@ -1,10 +1,10 @@
 use log::{LevelFilter, Log, Metadata, Record};
 use std::io::Write;
-use std::sync::OnceLock;
-use std::time::Instant;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Logs to stderr, each line led by the seconds since start.
-struct Logger(Instant);
+/// Logs to stderr, each line led by the local time of day, so a log lines up
+/// with what someone saw on screen.
+struct Logger;
 
 impl Log for Logger {
     fn enabled(&self, _: &Metadata) -> bool {
@@ -12,14 +12,19 @@ impl Log for Logger {
     }
 
     fn log(&self, r: &Record) {
-        let t = self.0.elapsed().as_secs_f64();
-        let _ = writeln!(std::io::stderr().lock(), "{t:9.3} {:<5} {}", r.level(), r.args());
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+        let secs = now.as_secs() as libc::time_t;
+        // SAFETY: localtime_r only writes the struct it is given.
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        unsafe { libc::localtime_r(&secs, &mut tm) };
+        let (h, m, s, ms) = (tm.tm_hour, tm.tm_min, tm.tm_sec, now.subsec_millis());
+        let _ = writeln!(std::io::stderr().lock(), "{h:02}:{m:02}:{s:02}.{ms:03} {:<5} {}", r.level(), r.args());
     }
 
     fn flush(&self) {}
 }
 
-static LOGGER: OnceLock<Logger> = OnceLock::new();
+static LOGGER: Logger = Logger;
 
 /// The level comes from `verbosity` (0 = info), or from RXCOM_LOG (error, warn,
 /// info, debug, trace) when that is set.
@@ -29,7 +34,7 @@ pub fn init(verbosity: u8) {
         1 => LevelFilter::Debug,
         _ => LevelFilter::Trace,
     });
-    if log::set_logger(LOGGER.get_or_init(|| Logger(Instant::now()))).is_ok() {
+    if log::set_logger(&LOGGER).is_ok() {
         log::set_max_level(level);
     }
 }
