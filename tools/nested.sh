@@ -1,11 +1,12 @@
 #!/bin/bash
 # Starts or stops a nested Xvfb for testing rxcom without touching the real display.
-#   tools/nested.sh start [N]   Xvfb :N (default 21), 1920x1080x24, Composite, no reset
+#   tools/nested.sh start [N] [WxH]   Xvfb :N (default 21), WxH (default 1920x1080), depth 24, Composite, no reset
 #   tools/nested.sh stop [N]
 # State lives in $RXCOM_SCRATCH (default ~/.cache/claude-scratch/rxcom).
 set -eu
 cmd=${1:-start}
 n=${2:-21}
+size=${3:-1920x1080}
 dir=${RXCOM_SCRATCH:-$HOME/.cache/claude-scratch/rxcom}
 mkdir -p "$dir/logs"
 pidfile="$dir/xvfb$n.pid"
@@ -15,7 +16,7 @@ start)
 		echo "Xvfb :$n already running (pid $(cat "$pidfile"))"
 		exit 0
 	fi
-	Xvfb ":$n" -screen 0 1920x1080x24 +extension Composite -nolisten tcp -noreset \
+	Xvfb ":$n" -screen 0 ${size}x24 +extension Composite -nolisten tcp -noreset \
 		>"$dir/logs/xvfb$n.log" 2>&1 &
 	echo $! >"$pidfile"
 	for _ in $(seq 50); do

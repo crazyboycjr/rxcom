@@ -499,3 +499,175 @@ in step with the picom patch.
    Pacing, flips and unredirection with games cannot be tested nested.
 6. A full `paru -Syu` would repair lavapipe (2.5) and let the tests run without
    the GPU. Is that a good time to do it?
+
+## 8. M2: the X server composes, Vulkan presents (decided 10-29)
+
+The goal for M2 is the user's: stop xcompmgr, start `rxcom &`, and use it as
+the daily compositor on this machine. Two findings rule out the prototype's
+design there.
+
+- **Window contents.** Each DRI3 export of a window pixmap on NVIDIA's X driver
+  exports the whole 600 to 700 MB heap buffer the pixmap lives in, and those
+  buffers stayed allocated inside Xorg (2 GB of VRAM on 10-22, 2.1). An import
+  also costs about 8 ms per map or resize.
+- **Synchronization.** NVIDIA's X driver sometimes never wakes a SyncAwaitFence
+  whose fence has completed: at VT switches for any client, and every one to
+  two and a half minutes for picom on 10-28. picom then waits forever in the round trip
+  after the await, which froze the desktop (`vt-debug2/repaint.md`). Only a
+  TriggerFence from outside, or destroying the fence, releases it.
+
+### 8.1 Measurements
+
+`phase0`, a probe that acts as the compositor of a nested server
+(`~/.cache/claude-scratch/rxcom/phase0.rs`, results beside it), redirected four
+windows on a 3840x2160 screen (one screen-sized, one half-screen, two ARGB at a
+third of the screen) and made the X server redraw all of them every frame.
+Medians:
+
+| Per frame at 3840x2160 | Xvfb (software) | Xwayland, glamor on the 4070 |
+| --- | ---: | ---: |
+| ShmGetImage of the screen-sized window | 2.05 ms | 3.53 ms |
+| ShmGetImage of an 800x600 rectangle | 0.11 ms | 1.33 ms |
+| XRender of the four windows and the background into a scene pixmap | 4.40 ms | 0.03 ms, 0.25 ms of X CPU |
+| XRender transform of the scene at 2x, nearest / bilinear | 3.3 / 6.3 ms | 0.02 / 0.02 ms |
+| TriggerFence, then QueryFence until it reads triggered | first query | first query |
+
+On a GPU-backed server a readback is the expensive operation: even a small
+rectangle costs over a millisecond of the X server's single thread, because the
+server must wait for its GPU and download. Composing the whole screen on the
+server's GPU costs a fraction of that. glamor only flushes on TriggerFence, so
+its fences say nothing about GPU completion; NVIDIA's X driver uses real GPU
+fences, which is why 2.2 measured waits of up to 14.5 ms.
+
+What the real display taught between 10-22 and 10-28, which no nested server can
+reproduce:
+
+- xcompmgr, which composes with XRender inside the X server and uses no fences,
+  ran daily on this driver until 10-22, including VT round trips.
+- Nothing suggests NVIDIA's X driver flips for the Present extension, and
+  Present's copies tear (xserver issue 641). Its NotifyMSC does follow the OLED's
+  vblanks, with a zero UST.
+- GLX texture-from-pixmap, picom's route, waits for a vblank inside Xorg on every
+  bind and release while any client has a vsync'd present pending: 6.6 to 7 ms per
+  resize at 240 Hz, 14 to 24 ms at 60 Hz (`infra/xorg-resize-stall.md`). NVIDIA
+  also loses every GL context at a VT switch.
+- Vulkan on the NVIDIA xcb surface offers FIFO, FIFO_RELAXED, IMMEDIATE and
+  FIFO_LATEST_READY, plus present_id and present_wait. FIFO presents and acquires
+  block outright while no vblank comes (the OLED switched away, the screen
+  blanked), and FIFO follows the lowest-numbered lit head, so the 60 Hz Philips
+  mirror paces it at 60 Hz, as it did picom.
+
+### 8.2 The choice
+
+The X server composes the desktop; Vulkan only presents it.
+
+- **Composition.** rxcom keeps one screen-sized scene pixmap. Each frame it asks
+  the X server to composite the damaged part of the screen into it with XRender:
+  the background, then every mapped window bottom to top through a picture on
+  its named pixmap (borders included), with the clip set to the damage region.
+  This is xcompmgr's paint path, the one proven on this driver. Window pixmaps
+  never leave the X server: no per-window export, import or readback, and a map
+  or resize costs two requests (name the pixmap, create a picture).
+- **One shared buffer.** The scene is the only buffer Vulkan sees, imported once
+  per screen size. rxcom allocates it in Vulkan with a modifier both sides accept
+  and gives it to X with DRI3 PixmapFromBuffers. If the X server refuses, X
+  allocates it and exports it once with BuffersFromPixmap (a screen-sized pixmap
+  gets a buffer of its own, as the 1920x1080 one did in 2.1).
+- **Presentation.** One full-screen pass draws the scene into the swapchain image,
+  1:1 or zoomed, and presents it with FIFO. On the full-screen overlay window the
+  driver flips at vblank, so nothing tears.
+- **The X presenter.** Without the Vulkan route (no DRI3, as on Xvfb; an import
+  the driver refuses; repeated device loss), the X server copies or zooms the
+  scene onto the overlay window itself, with CopyArea or an XRender transform.
+  That is xcompmgr's quality: it may tear, but it works on any server, and it is
+  what the nested pixel tests check.
+- **Zoom.** Exactly picom-zoom's rules, so both compositors agree: log-space easing
+  with a 40 ms time constant, the pointer polled every 4 ms while zoomed, the
+  centre of the pixel under the pointer fixed, picom's rounding of the zoomed
+  view's origin to whole pixels, nearest filtering by default. The prototype's
+  easing and anchoring differed (section 1.5 and 4.10).
+
+### 8.3 Synchronization
+
+X's rendering into the scene and Vulkan's sampling of it still run on different
+GPU channels, so they need a fence, but rxcom never sends SyncAwaitFence. After
+its composition requests it sends TriggerFence and then QueryFence, a plain
+query that reads the fence's state and does not depend on the wakeup NVIDIA
+loses, repeating it every 0.2 ms until the fence reads triggered while the
+Vulkan side records the frame. The X server never blocks on rxcom's behalf.
+A fence that still reads untriggered after 100 ms is destroyed and replaced, the
+frame goes out anyway, and one more repaint follows shortly after, so a lost
+fence costs at most one stale frame. After three timeouts in a row rxcom stops
+fencing and logs it once.
+
+In the other direction, X must not write the scene while Vulkan reads it. With
+one frame in flight (8.4) the previous frame's GPU work has finished by then;
+rxcom checks its Vulkan fence without blocking before it composes.
+
+### 8.4 Presentation and pacing
+
+- **One frame in flight.** A new frame is composed only after the previous one
+  reached the screen, which present_wait reports when polled with a zero
+  timeout; acquire also uses a zero timeout. Damage that arrives meanwhile merges
+  into the next frame. Latency stays at most one refresh plus the composition.
+- **No vblanks** (monitor off or away, DPMS, the VT switched away): the
+  outstanding present simply does not complete. rxcom keeps handling X events and
+  shows the latest state once it does; it never makes a call that waits for a
+  vblank.
+- **VT switches.** rxcom watches `/sys/class/tty/tty0/active` and compares it
+  with the root's `XFree86_VT`. When X's VT returns it recreates the swapchain
+  and repaints everything.
+- **RandR.** A new screen size gets a new scene and swapchain; any output change
+  repaints everything.
+- **A watchdog thread** aborts rxcom when a single turn of the loop has taken
+  more than 5 seconds, a driver call that never returns. The X server undoes
+  the redirection when rxcom's connection closes, so the desktop stays usable
+  without compositing. Exit on SIGINT, SIGTERM or SIGHUP restores the screen as
+  the prototype does.
+- **Unredirection,** picom's rule with its 200 ms delay: when the top-most mapped
+  window covers the screen and is opaque, and the zoom is off, rxcom waits for
+  its GPU work to finish (bounded), destroys the swapchain, unredirects the
+  windows and unmaps the overlay, as picom does. It redirects again as soon as
+  that stops being true, or when the zoom starts.
+
+### 8.5 Costs at 4K and 240 Hz
+
+- **X server:** the composition requests, about 0.25 ms of CPU per frame for four
+  windows redrawn in full on glamor, less when only part of the screen changes,
+  and nothing when idle. No readbacks and no GLX binds.
+- **rxcom:** recording and submitting about 0.1 ms per frame (2.4), plus one to
+  three fence queries.
+- **GPU:** X's composition of the damaged area, plus one full-screen pass per
+  frame (about 67 MB of memory traffic at 4K, roughly 0.13 ms on the 4070).
+- **Video memory:** the scene (33 MB) and three swapchain images (100 MB).
+- **Idle:** no frames and no CPU; while zoomed, the pointer query every 4 ms.
+
+### 8.6 Rejected
+
+- **Per-window DRI3 import**, the prototype's route: the heap buffers pinned in
+  Xorg and 8 ms per map or resize (2.1).
+- **Per-window MIT-SHM copies:** each readback blocks the X server's only thread
+  for its GPU wait and download, 1.3 to 3.5 ms each on a GPU-backed server (8.1).
+  A few damaged windows at 240 Hz would need more than the whole thread.
+- **GLX texture-from-pixmap:** the vblank wait inside Xorg on every bind, GL
+  contexts lost at every VT switch, and it needs the same fence.
+- **XRender composition presented by the X server alone** (xcompmgr's whole
+  design): the least code and no GPU context in rxcom, but it tears on this
+  driver. It stays as the fallback presenter.
+- **Waiting on X Sync fences inside the X server** (SyncAwaitFence): the lost
+  wakeups. DRI3 1.4 syncobjs are not in Xorg 21, and NVIDIA attaches no implicit
+  fences to dma-bufs (2.2).
+- **MAILBOX** does not exist on this surface; **IMMEDIATE** tears.
+
+### 8.7 What only the real display can answer
+
+- Whether NVIDIA's X driver accepts PixmapFromBuffers and renders into such a
+  pixmap at full speed; otherwise the BuffersFromPixmap route, otherwise the X
+  presenter. rxcom logs the route it took.
+- Whether QueryFence keeps reading triggered where SyncAwaitFence lost its
+  wakeup, and how long the polled waits are at 240 Hz.
+- Flips, pacing at 240 Hz, VT round trips, the monitor going away, and games
+  unredirected.
+
+`rxcom -v` logs the route, the fence waits and per-frame timings, so the user's
+first trial answers these.
