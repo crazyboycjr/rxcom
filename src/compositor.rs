@@ -505,7 +505,9 @@ impl Compositor {
                 self.stats.fence_max = self.stats.fence_max.max(start.elapsed());
             } else {
                 // Its trigger may be lost for good; draw anyway, with a new fence.
-                log::warn!("the X server's fence did not trigger within {} ms", FENCE_LIMIT.as_millis());
+                if self.stats.fence_timeouts == 0 {
+                    log::warn!("the X server's fence did not trigger within {} ms", FENCE_LIMIT.as_millis());
+                }
                 self.stats.fence_timeouts += 1;
                 self.x.conn.sync_destroy_fence(self.fence)?;
                 self.fence = self.x.create_fence()?;
