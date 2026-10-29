@@ -10,7 +10,7 @@ cmd=${1:-start}
 n=${2:-26}
 size=${3:-1920x1080}
 sock=rxcom-test
-dir=${RXCOM_SCRATCH:-$HOME/.cache/claude-scratch/rxcom}
+dir=${RXCOM_SCRATCH:-${XDG_CACHE_HOME:-$HOME/.cache}/rxcom-test}
 mkdir -p "$dir/logs"
 mpid=$dir/mutter$n.pid
 xpid=$dir/xwayland$n.pid

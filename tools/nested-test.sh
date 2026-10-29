@@ -10,12 +10,12 @@
 # tools/xwayland.sh) and is left running; the stall check is skipped there.
 #
 # Build first: cargo build --all-targets. Screenshots and logs go to
-# $RXCOM_SCRATCH/shots/run (default ~/.cache/claude-scratch/rxcom). The real
+# $RXCOM_SCRATCH/shots/run (default $XDG_CACHE_HOME/rxcom-test). The real
 # display is never touched.
 set -uo pipefail
 n=${1:-23}
 here=$(cd "$(dirname "$0")" && pwd)
-scratch=${RXCOM_SCRATCH:-$HOME/.cache/claude-scratch/rxcom}
+scratch=${RXCOM_SCRATCH:-${XDG_CACHE_HOME:-$HOME/.cache}/rxcom-test}
 out=$scratch/shots/run
 bin=${CARGO_TARGET_DIR:-$here/../target}/debug
 export DISPLAY=:$n

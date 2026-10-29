@@ -2,12 +2,12 @@
 # Starts or stops a nested Xvfb for testing rxcom without touching the real display.
 #   tools/nested.sh start [N] [WxH]   Xvfb :N (default 21), WxH (default 1920x1080), depth 24, Composite, no reset
 #   tools/nested.sh stop [N]
-# State lives in $RXCOM_SCRATCH (default ~/.cache/claude-scratch/rxcom).
+# State lives in $RXCOM_SCRATCH (default $XDG_CACHE_HOME/rxcom-test).
 set -eu
 cmd=${1:-start}
 n=${2:-21}
 size=${3:-1920x1080}
-dir=${RXCOM_SCRATCH:-$HOME/.cache/claude-scratch/rxcom}
+dir=${RXCOM_SCRATCH:-${XDG_CACHE_HOME:-$HOME/.cache}/rxcom-test}
 mkdir -p "$dir/logs"
 pidfile="$dir/xvfb$n.pid"
 case $cmd in

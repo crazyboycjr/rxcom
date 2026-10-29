@@ -14,7 +14,7 @@ set -uo pipefail
 n=${1:-24}
 steps=${2:-300}
 here=$(cd "$(dirname "$0")" && pwd)
-scratch=${RXCOM_SCRATCH:-$HOME/.cache/claude-scratch/rxcom}
+scratch=${RXCOM_SCRATCH:-${XDG_CACHE_HOME:-$HOME/.cache}/rxcom-test}
 out=$scratch/shots/stress
 bin=${CARGO_TARGET_DIR:-$here/../target}/debug
 export DISPLAY=:$n

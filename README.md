@@ -1,25 +1,27 @@
 # rxcom
 
-An X11 compositor in Rust on Vulkan, with a macOS-style desktop zoom. This is
-the prototype; DESIGN.md describes what it does, what we learned, and the
-proposal for the full version.
+An X11 compositor in Rust with a macOS-style desktop zoom. The X server
+composes the desktop with XRender; Vulkan presents it, flipped at vblank,
+wherever the X server can share the scene through DRI3, and the X server
+presents by itself elsewhere. DESIGN.md explains why (section 8) and keeps the
+record of the prototype before it.
 
 ## Build
 
-Needs Rust 1.88 or newer, libxcb, a Vulkan 1.3 driver with
-VK_KHR_push_descriptor, and `glslc` (Arch package `shaderc`).
+Needs Rust 1.88 or newer, libxcb, a Vulkan 1.3 driver and `glslc` (Arch package
+`shaderc`).
 
     cargo build --release
 
 ## Run
 
-rxcom refuses to start while another compositor owns the screen.
+rxcom refuses to start while another compositor owns the screen, and gives the
+screen back on SIGINT or SIGTERM.
 
-    rxcom [--display :N] [--gpu NAME] [--no-dri3] [--no-sync-fence]
-          [--max-fps N] [--background RRGGBB] [--validation] [-v|-vv]
+    rxcom [-v]           # rxcom --help lists the options
 
-Zoom through the root property shared with the patched picom (16.16 fixed
-point; 65536 or less, or no property, means no zoom):
+Zoom through the root property shared with picom-zoom (16.16 fixed point;
+65536 or less, or no property, means no zoom):
 
     xprop -root -f _PICOM_ZOOM 32c -set _PICOM_ZOOM 131072   # 2x
     xprop -root -remove _PICOM_ZOOM
@@ -30,14 +32,13 @@ Everything runs on nested X servers, never on the real display.
 
     cargo test --lib
     cargo build --all-targets
-    tools/nested-test.sh        # end-to-end checks on a nested Xvfb
-    tools/stress-test.sh 24 500 # random window operations under openbox
-    tools/xwayland.sh start 26  # a DRI3-capable nested server, then:
-    RXCOM_TEST_EXTERNAL=1 tools/nested-test.sh 26
+    tools/nested-test.sh                            # Xvfb: the X presenter
+    tools/stress-test.sh 24 500                     # random operations under openbox
+    tools/xwayland.sh start 26                      # a headless Xwayland with DRI3
+    RXCOM_TEST_EXTERNAL=1 tools/nested-test.sh 26   # there: the Vulkan presenter
+    RXCOM_TEST_EXTERNAL=1 tools/stress-test.sh 26 400
     tools/xwayland.sh stop 26
 
-The scripts use the NVIDIA Vulkan driver unless `VK_DRIVER_FILES` says
-otherwise, and write screenshots and logs under
-`~/.cache/claude-scratch/rxcom` (override with `RXCOM_SCRATCH`).
-`examples/dri3_import.rs` checks the DRI3 import path on a real X server; read
-its header before running it.
+`VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation` adds the validation layers;
+the scripts count their messages as failures. Screenshots and logs go to
+`$XDG_CACHE_HOME/rxcom-test` (override with `RXCOM_SCRATCH`).

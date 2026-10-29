@@ -1,11 +1,11 @@
 # rxcom design
 
-rxcom is an X11 compositor written in Rust that renders with Vulkan. The long-term
-goal is a compositor that can replace picom on the daily desktop, with the
-mainstream features of picom and xcompmgr plus a macOS-style desktop zoom. This
-document describes the prototype as it stands, what building it taught us, and a
-proposal for the full version. Nothing beyond the prototype gets built until the
-user has agreed to the proposal (sections 4 to 7).
+rxcom is an X11 compositor written in Rust. The goal is a compositor that
+replaces xcompmgr and picom on the daily desktop, with the mainstream features
+of picom and xcompmgr plus a macOS-style desktop zoom. Sections 1 to 7 describe
+the 10-22 prototype, what building it taught us and the proposal made then; they
+are kept as the record. Section 8 is the M2 design, decided and built on 10-29:
+it describes rxcom as it is now.
 
 ## 1. The prototype
 
@@ -518,8 +518,8 @@ design there.
 
 ### 8.1 Measurements
 
-`phase0`, a probe that acts as the compositor of a nested server
-(`~/.cache/claude-scratch/rxcom/phase0.rs`, results beside it), redirected four
+`phase0`, a probe that acts as the compositor of a nested server (kept outside
+the repository with its results), redirected four
 windows on a 3840x2160 screen (one screen-sized, one half-screen, two ARGB at a
 third of the screen) and made the X server redraw all of them every frame.
 Medians:
@@ -581,11 +581,14 @@ The X server composes the desktop; Vulkan only presents it.
   scene onto the overlay window itself, with CopyArea or an XRender transform.
   That is xcompmgr's quality: it may tear, but it works on any server, and it is
   what the nested pixel tests check.
-- **Zoom.** Exactly picom-zoom's rules, so both compositors agree: log-space easing
-  with a 40 ms time constant, the pointer polled every 4 ms while zoomed, the
-  centre of the pixel under the pointer fixed, picom's rounding of the zoomed
-  view's origin to whole pixels, nearest filtering by default. The prototype's
-  easing and anchoring differed (section 1.5 and 4.10).
+- **Zoom.** picom-zoom's rules, so both compositors agree: log-space easing with
+  a 40 ms time constant, the centre of the pixel under the pointer fixed,
+  picom's rounding of the zoomed view's origin to whole pixels, nearest
+  filtering by default. Instead of picom-zoom's 4 ms poll, XInput 2 raw motion
+  on the root tells rxcom that the pointer moved; it then queries the position
+  at most once a frame, and does nothing while the pointer rests. A 100 ms poll
+  remains for pointer warps, which make no raw motion. The prototype's easing
+  and anchoring differed (section 1.5 and 4.10).
 
 ### 8.3 Synchronization
 
@@ -596,34 +599,46 @@ query that reads the fence's state and does not depend on the wakeup NVIDIA
 loses, repeating it every 0.2 ms until the fence reads triggered while the
 Vulkan side records the frame. The X server never blocks on rxcom's behalf.
 A fence that still reads untriggered after 100 ms is destroyed and replaced, the
-frame goes out anyway, and one more repaint follows shortly after, so a lost
-fence costs at most one stale frame. After three timeouts in a row rxcom stops
-fencing and logs it once.
+frame goes out anyway, and the next frame repaints the whole scene, so a lost
+fence costs at most one stale frame. rxcom also asks SYNC SetPriority for its
+own connection, so the X server's scheduler serves its requests ahead of busy
+clients.
 
-In the other direction, X must not write the scene while Vulkan reads it. With
-one frame in flight (8.4) the previous frame's GPU work has finished by then;
-rxcom checks its Vulkan fence without blocking before it composes.
+In the other direction, X must not write the scene while Vulkan reads it. Before
+composing, rxcom checks without blocking that the GPU has finished the previous
+frame, through a timeline semaphore; that takes a fraction of a millisecond.
 
 ### 8.4 Presentation and pacing
 
-- **One frame in flight.** A new frame is composed only after the previous one
-  reached the screen, which present_wait reports when polled with a zero
-  timeout; acquire also uses a zero timeout. Damage that arrives meanwhile merges
-  into the next frame. Latency stays at most one refresh plus the composition.
-- **No vblanks** (monitor off or away, DPMS, the VT switched away): the
-  outstanding present simply does not complete. rxcom keeps handling X events and
-  shows the latest state once it does; it never makes a call that waits for a
-  vblank.
+- **FIFO_LATEST_READY.** A frame is composed and queued as soon as damage
+  arrives, up to the frame limit (240 by default), and at each vblank the
+  presentation engine shows the newest ready one. Acquire uses a zero timeout;
+  when no image is free, damage merges into the next frame and rxcom looks again
+  1 ms later (20 ms after 50 ms without one). FIFO is the fallback where the mode
+  is missing. present_wait is not needed for this and is not used.
+- **Present fences** (swapchain_maintenance1) tell when the presentation engine
+  is done with a present, so the swapchain is never destroyed while one is
+  queued; the validation layers flagged exactly that without them.
+- **No vblanks** (monitor off or away, DPMS, the VT switched away): presents stay
+  queued and acquire finds no free image. rxcom keeps handling X events and
+  shows the latest state once frames flow again; it never makes a call that
+  waits for a vblank. On the nested Xwayland a 6 s stop of the frame clock cost
+  rxcom 0.7% of a CPU.
 - **VT switches.** rxcom watches `/sys/class/tty/tty0/active` and compares it
-  with the root's `XFree86_VT`. When X's VT returns it recreates the swapchain
-  and repaints everything.
-- **RandR.** A new screen size gets a new scene and swapchain; any output change
-  repaints everything.
-- **A watchdog thread** aborts rxcom when a single turn of the loop has taken
-  more than 5 seconds, a driver call that never returns. The X server undoes
-  the redirection when rxcom's connection closes, so the desktop stays usable
-  without compositing. Exit on SIGINT, SIGTERM or SIGHUP restores the screen as
-  the prototype does.
+  with the root's `XFree86_VT`. When X's VT returns it sets the Vulkan side up
+  again with a new scene and repaints everything.
+- **RandR.** A new screen size gets a new scene and swapchain the same way.
+- **GPU errors** rebuild the Vulkan side; after three without a quiet minute
+  between them, the X server presents until the next rebuild.
+- **A watchdog thread** aborts rxcom when a single turn of the loop has been stuck
+  for 5 seconds outside poll(): a spin, or a driver call that never returns.
+  Waiting for the X server does not count, since a stalled or grabbed server
+  freezes the desktop whatever rxcom does. The X server undoes the redirection
+  when rxcom's connection closes, so the desktop is usable meanwhile, and the
+  watchdog starts a new rxcom, which backs off (1 s, then 2, 4, ... up to 32) and
+  takes over once the stuck one is gone; after five restarts in a row it stops.
+- **Signals.** SIGINT and SIGTERM restore the screen as the prototype does.
+  SIGHUP is ignored, so `rxcom &` outlives the terminal it was started from.
 - **Unredirection,** picom's rule with its 200 ms delay: when the top-most mapped
   window covers the screen and is opaque, and the zoom is off, rxcom waits for
   its GPU work to finish (bounded), destroys the swapchain, unredirects the
@@ -635,12 +650,15 @@ rxcom checks its Vulkan fence without blocking before it composes.
 - **X server:** the composition requests, about 0.25 ms of CPU per frame for four
   windows redrawn in full on glamor, less when only part of the screen changes,
   and nothing when idle. No readbacks and no GLX binds.
-- **rxcom:** recording and submitting about 0.1 ms per frame (2.4), plus one to
-  three fence queries.
+- **rxcom:** about 0.1 ms of CPU per frame, measured over 670 zoomed 4K frames on
+  the nested Xwayland (release build), fence queries included.
 - **GPU:** X's composition of the damaged area, plus one full-screen pass per
   frame (about 67 MB of memory traffic at 4K, roughly 0.13 ms on the 4070).
-- **Video memory:** the scene (33 MB) and three swapchain images (100 MB).
-- **Idle:** no frames and no CPU; while zoomed, the pointer query every 4 ms.
+- **Memory:** the scene (33 MB) and four swapchain images (133 MB) in video
+  memory; 95 to 115 MB resident, nearly all of it NVIDIA's driver (4 to 5 MB
+  with the X presenter).
+- **Idle:** no frames and no CPU; while zoomed and still, a pointer query every
+  100 ms.
 
 ### 8.6 Rejected
 
@@ -676,3 +694,35 @@ rxcom checks its Vulkan fence without blocking before it composes.
 
 `rxcom -v` logs the route, the fence waits and per-frame timings, so the user's
 first trial answers these.
+
+### 8.8 As built (10-29)
+
+| File | Lines | Role |
+| --- | ---: | --- |
+| `src/main.rs` | 136 | options, signals, start and restart |
+| `src/x.rs` | 390 | connection, extensions, selection, overlay, DRI3, fence, helpers |
+| `src/windows.rs` | 130 | the stacking list and each window's X resources |
+| `src/scene.rs` | 192 | the XRender composition, the X presenter, the background |
+| `src/compositor.rs` | 638 | events, damage, frames, unredirection, VT, recovery, the loop |
+| `src/gpu.rs` | 771 | the Vulkan presenter: the shared scene, the pass, the swapchain |
+| `src/zoom.rs` | 115 | picom-zoom's easing and view |
+| `src/watchdog.rs`, `vt.rs`, `logger.rs`, `lib.rs` | 184 | restarts, the VT watch, logging |
+| `shaders/` | 28 | the full-screen pass |
+
+That is about 2,550 lines of Rust without its unit tests, against xcompmgr's
+roughly 2,500 lines of C, which have shadows and fading but no Vulkan, zoom,
+unredirection or recovery. The dependencies are x11rb, ash, libc, log and
+anyhow; glslc builds the shaders.
+
+Tested on nested servers only (section 2.5): `tools/nested-test.sh` on Xvfb
+(the X presenter) and on headless Xwayland with the NVIDIA driver and the
+validation layers (the Vulkan presenter), `tools/stress-test.sh` on both, plus
+a stopped frame clock, two RandR resizes and the watchdog's restart by hand.
+On the nested Xwayland the X server took the Vulkan image through
+PixmapFromBuffers with modifier 0x0300000000606014, the one NVIDIA's X driver
+itself uses.
+
+Not used, though NVIDIA 615 offers them: present_id2/present_wait2 and their
+first versions (FIFO_LATEST_READY with a zero-timeout acquire paces without
+them), and VK_EXT_present_timing (not in ash's headers, and nothing needs vblank
+timestamps yet).
