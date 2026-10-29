@@ -69,6 +69,9 @@ pub struct Win {
     pub ignored: bool,
     /// The bounding region is not the plain rectangle.
     pub shaped: bool,
+    /// `_NET_WM_BYPASS_COMPOSITOR`: 1 asks for the screen when the window
+    /// covers it, 2 asks never to be unredirected, 0 leaves it to rxcom.
+    pub bypass: u32,
     pub damage: Option<u32>,
     pub pixmap: Option<u32>,
     pub picture: Option<u32>,

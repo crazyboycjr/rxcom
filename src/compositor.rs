@@ -330,9 +330,10 @@ impl Compositor {
                 watch(&self.x, &mut w);
             }
             self.x.conn.shape_select_input(id, true)?;
-            let exposures = ChangeWindowAttributesAux::new().event_mask(EventMask::EXPOSURE);
-            self.x.conn.change_window_attributes(id, &exposures)?;
+            let events = ChangeWindowAttributesAux::new().event_mask(EventMask::EXPOSURE | EventMask::PROPERTY_CHANGE);
+            self.x.conn.change_window_attributes(id, &events)?;
             w.shaped = self.x.bounding_shaped(id);
+            w.bypass = self.x.cardinal(id, self.x.atoms.bypass_compositor, AtomEnum::CARDINAL).unwrap_or(0);
         }
         if w.drawable() {
             w.stale = true;
@@ -565,6 +566,12 @@ impl Compositor {
                     self.scene.add_all(&self.x)?;
                 }
             }
+            Event::PropertyNotify(e) if e.atom == self.x.atoms.bypass_compositor => {
+                let v = (e.state != Property::DELETE).then(|| self.x.cardinal(e.window, e.atom, AtomEnum::CARDINAL));
+                if let Some(w) = self.wins.get_mut(e.window) {
+                    w.bypass = v.flatten().unwrap_or(0);
+                }
+            }
             Event::Expose(e) if e.window == self.x.overlay => self.full_present = true,
             // The client is asked to draw what the X server mapped.
             Event::Expose(e) => {
@@ -595,7 +602,8 @@ impl Compositor {
     }
 
     /// The top-most window when it covers the whole screen and nothing shows
-    /// through it, and the zoom is off: then the screen can be its own.
+    /// through it, or it asks for the screen, and the zoom is off: then the
+    /// screen can be its own. A window that asks to stay composited never is.
     fn fullscreen_window(&self) -> Option<Window> {
         if self.zoom.active() {
             return None;
@@ -607,7 +615,7 @@ impl Compositor {
             && r.x as i32 + r.width as i32 >= self.x.width as i32
             && r.y as i32 + r.height as i32 >= self.x.height as i32;
         let opaque = !w.shaped && !self.x.visual_format(w.visual).is_some_and(|f| f.alpha);
-        (covers && opaque).then_some(w.id)
+        (covers && w.bypass != 2 && (opaque || w.bypass == 1)).then_some(w.id)
     }
 
     /// Unredirects for a full-screen window once it has been on top for the

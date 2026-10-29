@@ -714,7 +714,10 @@ after 50 ms.
   window covers the screen and is opaque, and the zoom is off, rxcom waits for
   its GPU work to finish (bounded), destroys the swapchain, unredirects the
   windows and unmaps the overlay, as picom does. It redirects again as soon as
-  that stops being true, or when the zoom starts.
+  that stops being true, or when the zoom starts. `_NET_WM_BYPASS_COMPOSITOR`
+  on the window, as KWin and Mutter read it: 1 gives the screen to a covering
+  window even with alpha, 2 keeps the window composited (a lock screen that
+  must not flip into VRR, see 8.8).
 
 ### 8.6 Costs at 4K and 240 Hz
 

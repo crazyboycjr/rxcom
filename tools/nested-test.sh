@@ -325,6 +325,26 @@ sys.exit(0 if ok else 1)
 PY
 kill "$popup" "$fs"
 sleep 0.7
+# Whether the last unredirect or redirect in the log was an unredirect.
+unredirected() { grep -E "unredirecting the screen|compositing again" "$out/rxcom.log" | tail -1 | grep -q unredirecting; }
+echo "   _NET_WM_BYPASS_COMPOSITOR=2 keeps a full-screen opaque window composited:"
+"$bin/examples/argbwin" --geometry 1920x1080+0+0 --depth 24 --color ff406080 --override-redirect --name keep &
+keep=$!
+pids+=($keep)
+xprop -id "$(xdotool search --sync --name '^keep$' | head -1)" -f _NET_WM_BYPASS_COMPOSITOR 32c -set _NET_WM_BYPASS_COMPOSITOR 2
+sleep 1
+check eval '! unredirected'
+kill "$keep"
+sleep 0.5
+echo "   _NET_WM_BYPASS_COMPOSITOR=1 gives the screen to a full-screen ARGB window:"
+"$bin/examples/argbwin" --geometry 1920x1080+0+0 --depth 32 --color 80406080 --override-redirect --name bypass &
+bypass=$!
+pids+=($bypass)
+xprop -id "$(xdotool search --sync --name '^bypass$' | head -1)" -f _NET_WM_BYPASS_COMPOSITOR 32c -set _NET_WM_BYPASS_COMPOSITOR 1
+sleep 1
+check unredirected
+kill "$bypass"
+sleep 0.7
 
 echo "8. SIGTERM shuts down cleanly and leaves the screen as found"
 shot before_exit

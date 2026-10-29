@@ -29,6 +29,7 @@ pub struct Atoms {
     pub esetroot_pmap_id: u32,
     pub screen_zoom: u32,
     pub xfree86_vt: u32,
+    pub bypass_compositor: u32,
 }
 
 /// A picture format and whether it carries alpha.
@@ -128,6 +129,7 @@ impl X {
             esetroot_pmap_id: intern(&conn, "ESETROOT_PMAP_ID")?,
             screen_zoom: intern(&conn, "_SCREEN_ZOOM")?,
             xfree86_vt: intern(&conn, "XFree86_VT")?,
+            bypass_compositor: intern(&conn, "_NET_WM_BYPASS_COMPOSITOR")?,
         };
         Ok(X {
             conn,
@@ -292,7 +294,12 @@ impl X {
 
     /// Reads a single 32-bit value of a root property.
     pub fn root_cardinal(&self, atom: u32, ty: impl Into<u32>) -> Option<u32> {
-        let r = self.conn.get_property(false, self.root, atom, ty, 0, 1).ok()?.reply().ok()?;
+        self.cardinal(self.root, atom, ty)
+    }
+
+    /// Reads a single 32-bit value of a window's property.
+    pub fn cardinal(&self, window: Window, atom: u32, ty: impl Into<u32>) -> Option<u32> {
+        let r = self.conn.get_property(false, window, atom, ty, 0, 1).ok()?.reply().ok()?;
         r.value32()?.next()
     }
 
