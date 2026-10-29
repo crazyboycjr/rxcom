@@ -742,17 +742,17 @@ first trial answers these.
 
 | File | Lines | Role |
 | --- | ---: | --- |
-| `src/main.rs` | 136 | options, signals, start and restart |
-| `src/x.rs` | 390 | connection, extensions, selection, overlay, DRI3, fence, helpers |
-| `src/windows.rs` | 130 | the stacking list and each window's X resources |
-| `src/scene.rs` | 192 | the XRender composition, the X presenter, the background |
-| `src/compositor.rs` | 638 | events, damage, frames, unredirection, VT, recovery, the loop |
-| `src/gpu.rs` | 771 | the Vulkan presenter: the shared scene, the pass, the swapchain |
+| `src/main.rs` | 137 | options, signals, start and restart |
+| `src/x.rs` | 428 | connection, extensions, selection, overlay, DRI3, fence, helpers |
+| `src/windows.rs` | 198 | the stacking list, each window's X resources and stand-in |
+| `src/scene.rs` | 218 | the XRender composition, stand-ins, the X presenter, the background |
+| `src/compositor.rs` | 802 | events, damage, waiting for clients, frames, unredirection, VT, recovery, the loop |
+| `src/gpu.rs` | 775 | the Vulkan presenter: the shared scene, the pass, the swapchain |
 | `src/zoom.rs` | 115 | picom-zoom's easing and view |
 | `src/watchdog.rs`, `vt.rs`, `logger.rs`, `lib.rs` | 184 | restarts, the VT watch, logging |
 | `shaders/` | 28 | the full-screen pass |
 
-That is about 2,550 lines of Rust without its unit tests, against xcompmgr's
+That is about 2,860 lines of Rust without its unit tests, against xcompmgr's
 roughly 2,500 lines of C, which have shadows and fading but no Vulkan, zoom,
 unredirection or recovery. The dependencies are x11rb, ash, libc, log and
 anyhow; glslc builds the shaders.
