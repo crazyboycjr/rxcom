@@ -786,8 +786,12 @@ impl Compositor {
             if let Some(vt) = &self.vt {
                 fds.push(libc::pollfd { fd: vt.fd(), events: libc::POLLPRI | libc::POLLERR, revents: 0 });
             }
-            let ms = timeout.map_or(-1, |t| t.as_micros().div_ceil(1000).min(i32::MAX as u128) as i32);
-            if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, ms) } < 0 {
+            let ts = timeout.map(|t| libc::timespec {
+                tv_sec: t.as_secs().min(i32::MAX as u64) as libc::time_t,
+                tv_nsec: t.subsec_nanos().into(),
+            });
+            let ts = ts.as_ref().map_or(std::ptr::null(), |t| t as *const libc::timespec);
+            if unsafe { libc::ppoll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, ts, std::ptr::null()) } < 0 {
                 let e = std::io::Error::last_os_error();
                 if e.kind() != std::io::ErrorKind::Interrupted {
                     return Err(e).context("poll");
