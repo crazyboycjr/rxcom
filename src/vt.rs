@@ -29,6 +29,11 @@ impl Vt {
         self.file.as_raw_fd()
     }
 
+    /// Whether the X server's VT is in front, as far as rxcom knows.
+    pub fn ours(&self) -> bool {
+        self.active.is_none_or(|a| a == self.x_vt)
+    }
+
     /// Rereads the active VT after poll reported a change; true when the X
     /// server's VT has just come back to the front.
     pub fn returned(&mut self) -> bool {

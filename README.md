@@ -20,6 +20,17 @@ screen back on SIGINT or SIGTERM.
 
     rxcom [-v]           # rxcom --help lists the options
 
+The Vulkan presenter presents at every refresh, even when nothing changed. Its
+full-screen swapchain flips, which puts a G-SYNC or FreeSync monitor into
+variable refresh, and NVIDIA's driver lets no Vulkan program on X opt out:
+presenting only on changes would let the monitor's refresh follow the
+desktop's pauses, so the cursor would move at the monitor's lowest rate, and
+some monitors black out as variable refresh switches on and off. An unchanged
+frame is presented again without drawing anything. Nothing is presented while
+a game has the screen (it keeps its own variable refresh), while the screen
+saver blanks the screen, while no monitor is lit or while another VT is in
+front. `--no-continuous` presents only on changes.
+
 Zoom through the root property `_SCREEN_ZOOM`, which xcompmgr-zoom reads too:
 
     xprop -root -f _SCREEN_ZOOM 32c -set _SCREEN_ZOOM 131072   # 2x

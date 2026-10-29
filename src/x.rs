@@ -11,6 +11,7 @@ use x11rb::protocol::damage::{self, ConnectionExt as _};
 use x11rb::protocol::dri3::{self, ConnectionExt as _};
 use x11rb::protocol::randr::{self, ConnectionExt as _};
 use x11rb::protocol::render::{self, ConnectionExt as _, PictType};
+use x11rb::protocol::screensaver::{self, ConnectionExt as _};
 use x11rb::protocol::shape::{self, ConnectionExt as _};
 use x11rb::protocol::sync::ConnectionExt as _;
 use x11rb::protocol::xfixes::ConnectionExt as _;
@@ -54,6 +55,8 @@ pub struct X {
     pub xi2: bool,
     /// RandR 1.3, for the monitors' refresh rates.
     pub randr: bool,
+    /// MIT-SCREEN-SAVER, which tells when the screen saver blanks the screen.
+    pub screensaver: bool,
     /// Owns the _NET_WM_CM_Sn selection.
     pub owner: Window,
     pub overlay: Window,
@@ -88,6 +91,8 @@ impl X {
             && conn.xinput_xi_query_version(2, 2)?.reply().is_ok();
         let randr = conn.extension_information(randr::X11_EXTENSION_NAME)?.is_some()
             && conn.randr_query_version(1, 3)?.reply().is_ok_and(|v| (v.major_version, v.minor_version) >= (1, 3));
+        let screensaver = conn.extension_information(screensaver::X11_EXTENSION_NAME)?.is_some()
+            && conn.screensaver_query_version(1, 1)?.reply().is_ok();
         conn.sync_initialize(3, 1)?.reply().context("no SYNC extension")?;
         // The X server's scheduler then serves rxcom's requests ahead of busy clients.
         conn.sync_set_priority(x11rb::NONE, 10)?;
@@ -137,6 +142,7 @@ impl X {
             dri3,
             xi2,
             randr,
+            screensaver,
             owner: x11rb::NONE,
             overlay: x11rb::NONE,
         })
@@ -199,8 +205,18 @@ impl X {
         if self.randr {
             c.randr_select_input(self.root, randr::NotifyMask::CRTC_CHANGE)?;
         }
+        if self.screensaver {
+            c.screensaver_select_input(self.root, screensaver::Event::NOTIFY_MASK)?;
+        }
         c.flush()?;
         Ok(())
+    }
+
+    /// Whether the screen saver blanks the screen now.
+    pub fn saver_on(&self) -> bool {
+        let on = [screensaver::State::ON, screensaver::State::CYCLE].map(u8::from);
+        let info = || self.conn.screensaver_query_info(self.root).ok()?.reply().ok();
+        self.screensaver && info().is_some_and(|i| on.contains(&i.state))
     }
 
     /// Hands the screen back to the windows, for a full-screen window that does

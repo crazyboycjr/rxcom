@@ -1,7 +1,8 @@
 //! The Vulkan presenter. The X server composes the desktop into a scene image
-//! it shares with Vulkan through a dma-buf; each frame one pass draws that
-//! image, 1:1 or zoomed, into a swapchain image on the overlay window, and the
-//! driver flips it at vblank. Nothing here ever waits for a vblank.
+//! it shares with Vulkan through a dma-buf; one pass draws that image, 1:1 or
+//! zoomed, into a swapchain image on the overlay window, unless that image
+//! shows it already, and the driver flips it at vblank. Nothing here ever
+//! waits for a vblank.
 
 use crate::x::X;
 use crate::zoom::View;
@@ -94,6 +95,10 @@ struct Swapchain {
     views: Vec<vk::ImageView>,
     /// Signalled when rendering into image i is done; its present waits on it.
     rendered: Vec<vk::Semaphore>,
+    /// The content version each image was last drawn with. Presenting only
+    /// reads an image, so one that holds the current version is presented
+    /// again as it is.
+    held: Vec<Option<u64>>,
 }
 
 struct Slot {
@@ -135,6 +140,8 @@ pub struct Gpu {
     slots: Vec<Slot>,
     timeline: vk::Semaphore,
     frame: u64,
+    /// The last frame that read the scene.
+    scene_read: u64,
     acquired: Option<(u32, usize)>,
     pub route: String,
     s: Surface,
@@ -309,6 +316,7 @@ impl Gpu {
             slots: Vec::new(),
             timeline: vk::Semaphore::null(),
             frame: 0,
+            scene_read: 0,
             acquired: None,
             route: String::new(),
             s,
@@ -610,14 +618,15 @@ impl Gpu {
         let d = &self.device;
         let handle = unsafe { self.swapchain_fn.create_swapchain(&info, None) }.context("vkCreateSwapchainKHR")?;
         let images = unsafe { self.swapchain_fn.get_swapchain_images(handle)? };
-        let mut sc = Swapchain { handle, extent: caps.current_extent, views: Vec::new(), rendered: Vec::new(), images };
+        let held = vec![None; images.len()];
+        let (views, rendered) = (Vec::new(), Vec::new());
+        let mut sc = Swapchain { handle, extent: caps.current_extent, images, views, rendered, held };
         for &image in &sc.images {
             sc.views.push(view(d, image, self.surface_format.format)?);
             sc.rendered.push(unsafe { d.create_semaphore(&vk::SemaphoreCreateInfo::default(), None)? });
         }
-        let vrr = std::env::var("__GL_VRR_ALLOWED").unwrap_or_default();
         log::info!(
-            "swapchain {}x{}, {} images, present mode {}{}, __GL_VRR_ALLOWED={vrr}",
+            "swapchain {}x{}, {} images, present mode {}{}",
             sc.extent.width,
             sc.extent.height,
             sc.images.len(),
@@ -690,9 +699,16 @@ impl Gpu {
         next
     }
 
+    /// Whether a present replaces one still queued, as FIFO_LATEST_READY's and
+    /// IMMEDIATE's do, so that presenting more often than the monitor refreshes
+    /// queues nothing. With FIFO it would fill the queue and add latency.
+    pub fn keeps_newest(&self) -> bool {
+        self.mode == FIFO_LATEST_READY || self.mode == vk::PresentModeKHR::IMMEDIATE
+    }
+
     /// Whether the GPU has finished reading the scene, so X may draw into it.
     pub fn scene_free(&self) -> Result<bool> {
-        Ok(unsafe { self.device.get_semaphore_counter_value(self.timeline)? } >= self.frame)
+        Ok(unsafe { self.device.get_semaphore_counter_value(self.timeline)? } >= self.scene_read)
     }
 
     /// Takes a swapchain image for the next frame without waiting. False when
@@ -724,11 +740,64 @@ impl Gpu {
         Ok(true)
     }
 
-    /// Draws the scene with `view` into the acquired image and presents it.
-    pub fn draw(&mut self, view: View, linear: bool) -> Result<()> {
+    /// Presents the acquired image showing the scene with `view`. It draws the
+    /// image first unless the image holds `content` (the caller's version of
+    /// what the screen shows) already, and returns whether it drew.
+    pub fn draw(&mut self, view: View, linear: bool, content: u64) -> Result<bool> {
         let (image, slot) = self.acquired.take().context("no image acquired")?;
+        let (i, cmd) = (image as usize, self.slots[slot].cmd);
         let sc = self.swapchain.as_ref().context("no swapchain")?;
-        let (d, cmd, i) = (&self.device, self.slots[slot].cmd, image as usize);
+        let (handle, rendered, draws) = (sc.handle, sc.rendered[i], sc.held[i] != Some(content));
+        let mut wait_stage = S::ALL_COMMANDS;
+        if draws {
+            self.record(cmd, i, view, linear)?;
+            wait_stage = S::COLOR_ATTACHMENT_OUTPUT;
+        }
+        let d = &self.device;
+        self.frame += 1;
+        self.slots[slot].value = self.frame;
+        if draws {
+            self.scene_read = self.frame;
+        }
+        // An image presented again as it is passes the wait on to its present.
+        let waits = [vk::SemaphoreSubmitInfo::default().semaphore(self.slots[slot].acquired).stage_mask(wait_stage)];
+        let signals = [
+            vk::SemaphoreSubmitInfo::default().semaphore(rendered).stage_mask(S::ALL_COMMANDS),
+            vk::SemaphoreSubmitInfo::default().semaphore(self.timeline).value(self.frame).stage_mask(S::ALL_COMMANDS),
+        ];
+        let cmds = [vk::CommandBufferSubmitInfo::default().command_buffer(cmd)];
+        let mut submit = vk::SubmitInfo2::default().wait_semaphore_infos(&waits).signal_semaphore_infos(&signals);
+        if draws {
+            submit = submit.command_buffer_infos(&cmds);
+        }
+        unsafe { d.queue_submit2(self.queue, &[submit], vk::Fence::null()) }.context("vkQueueSubmit2")?;
+        if let Some(sc) = &mut self.swapchain {
+            sc.held[i] = Some(content);
+        }
+        let (wait, swapchains, images, fence) = ([rendered], [handle], [image], [self.slots[slot].presented]);
+        let mut present =
+            vk::PresentInfoKHR::default().wait_semaphores(&wait).swapchains(&swapchains).image_indices(&images);
+        let mut fence_info = vk::SwapchainPresentFenceInfoEXT::default().fences(&fence);
+        if self.present_fences {
+            unsafe { d.reset_fences(&fence)? };
+            present = present.push_next(&mut fence_info);
+            self.slots[slot].present_at = Some((std::time::Instant::now(), false));
+        }
+        match unsafe { self.swapchain_fn.queue_present(self.queue, &present) } {
+            Ok(false) => {}
+            Ok(true) | Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                log::info!("swapchain suboptimal or out of date at present");
+                self.drop_swapchain();
+            }
+            Err(e) => return Err(e).context("vkQueuePresentKHR"),
+        }
+        Ok(draws)
+    }
+
+    /// Records the pass that draws the scene with `view` into swapchain image `i`.
+    fn record(&self, cmd: vk::CommandBuffer, i: usize, view: View, linear: bool) -> Result<()> {
+        let sc = self.swapchain.as_ref().context("no swapchain")?;
+        let d = &self.device;
         let ours = if self.foreign { (vk::QUEUE_FAMILY_FOREIGN_EXT, self.family) } else { IGNORED };
         let theirs = (ours.1, ours.0);
         // The X server leaves the scene in GENERAL; the GPU samples it, draws the
@@ -773,41 +842,6 @@ impl Gpu {
             d.cmd_end_rendering(cmd);
             d.cmd_pipeline_barrier2(cmd, &vk::DependencyInfo::default().image_memory_barriers(&after));
             d.end_command_buffer(cmd)?;
-
-            self.frame += 1;
-            self.slots[slot].value = self.frame;
-            let waits = [vk::SemaphoreSubmitInfo::default().semaphore(self.slots[slot].acquired).stage_mask(target.0)];
-            let signals = [
-                vk::SemaphoreSubmitInfo::default().semaphore(sc.rendered[i]).stage_mask(S::ALL_COMMANDS),
-                vk::SemaphoreSubmitInfo::default()
-                    .semaphore(self.timeline)
-                    .value(self.frame)
-                    .stage_mask(S::ALL_COMMANDS),
-            ];
-            let cmds = [vk::CommandBufferSubmitInfo::default().command_buffer(cmd)];
-            let submit = vk::SubmitInfo2::default()
-                .wait_semaphore_infos(&waits)
-                .command_buffer_infos(&cmds)
-                .signal_semaphore_infos(&signals);
-            d.queue_submit2(self.queue, &[submit], vk::Fence::null()).context("vkQueueSubmit2")?;
-            let (wait, swapchains, images, fence) =
-                ([sc.rendered[i]], [sc.handle], [image], [self.slots[slot].presented]);
-            let mut present =
-                vk::PresentInfoKHR::default().wait_semaphores(&wait).swapchains(&swapchains).image_indices(&images);
-            let mut fence_info = vk::SwapchainPresentFenceInfoEXT::default().fences(&fence);
-            if self.present_fences {
-                d.reset_fences(&fence)?;
-                present = present.push_next(&mut fence_info);
-                self.slots[slot].present_at = Some((std::time::Instant::now(), false));
-            }
-            match self.swapchain_fn.queue_present(self.queue, &present) {
-                Ok(false) => {}
-                Ok(true) | Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
-                    log::info!("swapchain suboptimal or out of date at present");
-                    self.drop_swapchain();
-                }
-                Err(e) => return Err(e).context("vkQueuePresentKHR"),
-            }
         }
         Ok(())
     }

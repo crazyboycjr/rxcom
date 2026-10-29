@@ -18,6 +18,7 @@ usage: rxcom [options]
                           fastest lit monitor)
   --present-mode M        latest (FIFO_LATEST_READY, the default where offered),
                           fifo, relaxed (FIFO_RELAXED) or immediate (tears)
+  --no-continuous         with Vulkan, present only when something changed
   --background RRGGBB     colour where no wallpaper is set (default 303030)
   -v, -vv                 more logging (or RXCOM_LOG=debug)
   -h, --help
@@ -27,8 +28,10 @@ Zoom: the window manager sets the root property _SCREEN_ZOOM (CARDINAL/32,
   xprop -root -f _SCREEN_ZOOM 32c -set _SCREEN_ZOOM 131072
   xprop -root -remove _SCREEN_ZOOM
 
-The Vulkan presenter keeps the monitor at its fixed refresh rate: on NVIDIA it
-sets __GL_VRR_ALLOWED=0 for itself unless that is set already.
+The Vulkan presenter presents at every refresh, even when nothing changed, so
+that a variable-refresh (G-SYNC, FreeSync) monitor stays at its top rate:
+NVIDIA gives Vulkan applications on X no way to opt out of variable refresh.
+Presenting an unchanged frame copies nothing.
 ";
 
 /// Stops rxcom if one turn of its loop is stuck for longer than this.
@@ -42,6 +45,7 @@ fn parse_args() -> Result<(Options, u8)> {
         linear: false,
         max_fps: None,
         present_mode: None,
+        continuous: true,
         background: 0x303030,
     };
     let mut verbose = 0;
@@ -69,6 +73,7 @@ fn parse_args() -> Result<(Options, u8)> {
                 o.present_mode =
                     Some(mode.with_context(|| format!("--present-mode {m}: not latest, fifo, relaxed or immediate"))?);
             }
+            "--no-continuous" => o.continuous = false,
             "--background" => {
                 let v = value()?;
                 o.background = u32::from_str_radix(v.trim_start_matches('#'), 16).context("--background RRGGBB")?;
@@ -126,13 +131,6 @@ fn start(opts: &Options) -> Result<Compositor> {
 }
 
 fn main() -> ExitCode {
-    // A compositor's flips must not put the monitor into variable refresh, as
-    // NVIDIA's own profiles rule for every compositor they know. Set before
-    // libvulkan loads and before any thread starts.
-    if std::env::var_os("__GL_VRR_ALLOWED").is_none() {
-        // SAFETY: the process has no other thread yet.
-        unsafe { std::env::set_var("__GL_VRR_ALLOWED", "0") };
-    }
     let (opts, verbose) = match parse_args() {
         Ok(v) => v,
         Err(e) => {

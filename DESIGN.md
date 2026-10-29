@@ -606,8 +606,10 @@ own connection, so the X server's scheduler serves its requests ahead of busy
 clients.
 
 In the other direction, X must not write the scene while Vulkan reads it. Before
-composing, rxcom checks without blocking that the GPU has finished the previous
-frame, through a timeline semaphore; that takes a fraction of a millisecond.
+composing, rxcom checks without blocking that the GPU has finished the last
+frame that read the scene, through a timeline semaphore; that takes a fraction
+of a millisecond. A frame presented again without drawing (8.5) reads nothing
+and does not count.
 
 ### 8.4 Windows their clients have not drawn yet
 
@@ -656,7 +658,35 @@ after 50 ms.
   zero timeout; when no image is free, damage merges into the next frame and
   rxcom looks again 1 ms later (20 ms after 50 ms without one). FIFO is the
   fallback where the mode is missing. present_wait is not needed for this and
-  is not used.
+  is not used. rxcom sleeps in ppoll, to the microsecond: poll's whole
+  milliseconds had spaced timed frames up to 5 ms apart.
+- **Continuous presentation** (10-29). A flipping full-screen swapchain puts a
+  G-SYNC or G-SYNC Compatible monitor into variable refresh, and NVIDIA's driver
+  gives Vulkan on X no way out: its application profiles and `__GL_VRR_ALLOWED`
+  are OpenGL's, it folds `__GL_GSYNC_ALLOWED` into the same setting, and the
+  VKDirect keys apply to direct-to-display swapchains at modeset. In the 10-29
+  trial the driver's VRR indicator read "G-SYNC" with each of them. Presenting
+  only on damage let the refresh follow the desktop down to the monitor's 48 Hz
+  floor whenever it rested, so the cursor, which moves only at a refresh, felt
+  like 60 Hz, and the AW2725Q blacked out for seconds each time variable refresh
+  engaged. So by
+  default the Vulkan presenter presents at every refresh of the fastest lit
+  monitor, 5% faster than the refresh period, so that a variable-refresh monitor
+  never waits for a frame and stays at its top rate; FIFO_LATEST_READY shows the
+  newest at each vblank. A compositor gains nothing from variable refresh, and
+  games keep theirs, since they get the screen by unredirection. Such a present
+  never delays a frame with news, which supersedes it, and costs the X server
+  nothing: no composition, no fence. Presenting only reads an image, so the
+  Vulkan side remembers the content each swapchain image holds and presents one
+  that holds the current frame again without drawing, its acquire semaphore
+  passed on to the present by an empty submit; after a change each image is
+  drawn once more. Nothing is presented while a window is unredirected, while
+  the screen saver blanks the screen (MIT-SCREEN-SAVER), while no monitor is lit,
+  while another VT is in front, or after 50 ms without a free image, after which
+  rxcom looks for one every 250 ms. It needs a present mode in which a present
+  replaces a queued one (FIFO_LATEST_READY, IMMEDIATE): with FIFO it would keep
+  the queue full and add frames of latency. `--no-continuous` presents only on
+  changes.
 - **Present fences** (swapchain_maintenance1) tell when the presentation engine
   is done with a present, so the swapchain is never destroyed while one is
   queued; the validation layers flagged exactly that without them.
@@ -698,8 +728,11 @@ after 50 ms.
 - **Memory:** the scene (33 MB) and four swapchain images (133 MB) in video
   memory; 95 to 115 MB resident, nearly all of it NVIDIA's driver (4 to 5 MB
   with the X presenter).
-- **Idle:** no frames and no CPU; while zoomed and still, a pointer query every
-  100 ms.
+- **Idle:** a present at every refresh that draws nothing and asks nothing of
+  the X server, which handles each present for the driver. On the nested
+  Xwayland at 249 presents a second rxcom used 1.5% of a core and Xwayland 0.5%
+  (release build). With `--no-continuous`, no frames and no CPU. While zoomed
+  and still, a pointer query every 100 ms.
 
 ### 8.7 Rejected
 
@@ -717,6 +750,11 @@ after 50 ms.
   wakeups. DRI3 1.4 syncobjs are not in Xorg 21, and NVIDIA attaches no implicit
   fences to dma-bufs (2.2).
 - **MAILBOX** does not exist on this surface; **IMMEDIATE** tears.
+- **Opting rxcom out of variable refresh** with `__GL_VRR_ALLOWED`,
+  `__GL_GSYNC_ALLOWED` or an application profile: NVIDIA's Vulkan swapchains on X
+  ignore them (8.5). Turning variable refresh off for the whole screen
+  (AllowVRR, the AllowGSYNCCompatible MetaMode, the monitor's menu) would take
+  it from games too.
 
 ### 8.8 What only the real display can answer
 
@@ -734,6 +772,10 @@ after 50 ms.
   unredirected.
 - That windows no longer show old frames when they appear or change size while
   the Vulkan swapchain flips (8.4).
+- That continuous presentation holds the AW2725Q at 240 Hz without blackouts,
+  and what it costs in GPU power against the X presenter with and without
+  ForceFullCompositionPipeline. A fence wait still blocks rxcom's loop: the
+  trials saw a few of 25 to 60 ms, each a gap in the presents.
 
 `rxcom -v` logs the route, the fence waits and per-frame timings, so the user's
 first trial answers these.
@@ -742,17 +784,17 @@ first trial answers these.
 
 | File | Lines | Role |
 | --- | ---: | --- |
-| `src/main.rs` | 137 | options, signals, start and restart |
-| `src/x.rs` | 428 | connection, extensions, selection, overlay, DRI3, fence, helpers |
+| `src/main.rs` | 154 | options, signals, start and restart |
+| `src/x.rs` | 444 | connection, extensions, selection, overlay, DRI3, fence, screen saver, helpers |
 | `src/windows.rs` | 198 | the stacking list, each window's X resources and stand-in |
 | `src/scene.rs` | 218 | the XRender composition, stand-ins, the X presenter, the background |
-| `src/compositor.rs` | 802 | events, damage, waiting for clients, frames, unredirection, VT, recovery, the loop |
-| `src/gpu.rs` | 775 | the Vulkan presenter: the shared scene, the pass, the swapchain |
+| `src/compositor.rs` | 920 | events, damage, waiting for clients, frames and their pacing, unredirection, VT, recovery, the loop |
+| `src/gpu.rs` | 870 | the Vulkan presenter: the shared scene, the pass, the swapchain and what its images hold |
 | `src/zoom.rs` | 115 | picom-zoom's easing and view |
-| `src/watchdog.rs`, `vt.rs`, `logger.rs`, `lib.rs` | 184 | restarts, the VT watch, logging |
+| `src/watchdog.rs`, `vt.rs`, `logger.rs`, `lib.rs` | 194 | restarts, the VT watch, logging |
 | `shaders/` | 28 | the full-screen pass |
 
-That is about 2,860 lines of Rust without its unit tests, against xcompmgr's
+That is about 3,110 lines of Rust without its unit tests, against xcompmgr's
 roughly 2,500 lines of C, which have shadows and fading but no Vulkan, zoom,
 unredirection or recovery. The dependencies are x11rb, ash, libc, log and
 anyhow; glslc builds the shaders.

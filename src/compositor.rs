@@ -16,6 +16,7 @@ use x11rb::protocol::Event;
 use x11rb::protocol::composite::ConnectionExt as _;
 use x11rb::protocol::damage::{ConnectionExt as _, ReportLevel};
 use x11rb::protocol::render::ConnectionExt as _;
+use x11rb::protocol::screensaver;
 use x11rb::protocol::shape::{self, ConnectionExt as _};
 use x11rb::protocol::sync::ConnectionExt as _;
 use x11rb::protocol::xfixes::ConnectionExt as _;
@@ -35,6 +36,8 @@ pub struct Options {
     pub max_fps: Option<f64>,
     /// None: FIFO_LATEST_READY where offered, else FIFO.
     pub present_mode: Option<ash::vk::PresentModeKHR>,
+    /// With Vulkan, present at every refresh even when nothing changed.
+    pub continuous: bool,
     pub background: u32,
 }
 
@@ -53,11 +56,25 @@ const DRAWING_LIMIT: Duration = Duration::from_millis(500);
 const STATS_EVERY: Duration = Duration::from_secs(10);
 /// A wait for a free swapchain image this long is logged.
 const NO_IMAGE_LOG: Duration = Duration::from_millis(200);
+/// Continuous frames come this much sooner than the refresh period, so that a
+/// variable-refresh monitor never waits for one and stays at its top rate; at
+/// each refresh the presentation engine shows the newest.
+const CONTINUOUS_PACE: f64 = 0.95;
+/// No free swapchain image for this long means no vblanks (monitor off). Then
+/// rxcom looks for one every NO_VBLANKS_RETRY while it has news to show, and
+/// every NO_VBLANKS_IDLE_RETRY while it has none.
+const NO_VBLANKS: Duration = Duration::from_millis(50);
+const NO_VBLANKS_RETRY: Duration = Duration::from_millis(20);
+const NO_VBLANKS_IDLE_RETRY: Duration = Duration::from_millis(250);
 
 #[derive(Default)]
 struct Stats {
     frames: u32,
-    /// Frames that waited for a free swapchain image.
+    /// Frames the X server composed, and frames Vulkan drew rather than
+    /// present an image that showed them already.
+    composed: u32,
+    drawn: u32,
+    /// Frames with news that waited for a free swapchain image.
     no_image: u32,
     /// From the composition until the fence read triggered: summed, worst.
     fence_sum: Duration,
@@ -101,7 +118,18 @@ pub struct Compositor {
     unredirected: Option<Window>,
     vt: Option<Vt>,
     quit: bool,
+    /// The last frame that had something new to show, and the last present.
     last_frame: Option<Instant>,
+    last_present: Option<Instant>,
+    /// Counts versions of what the screen shows: a new one whenever the scene,
+    /// the view or the overlay changes. Vulkan redraws only a swapchain image
+    /// drawn with an older one.
+    content: u64,
+    continuous: bool,
+    /// A monitor is lit (RandR), so there is a refresh to keep up with.
+    lit: bool,
+    /// The screen saver blanks the screen.
+    saver: bool,
     max_fps: Option<f64>,
     present_mode: Option<ash::vk::PresentModeKHR>,
     min_interval: Duration,
@@ -116,10 +144,10 @@ fn pending_signal(sigfd: RawFd) -> Option<u32> {
     (n == info.len() as isize).then(|| u32::from_ne_bytes(info[..4].try_into().unwrap()))
 }
 
-/// The shortest time between frames: the user's limit, else the fastest lit
-/// monitor's refresh period, else 60 Hz's (a server without RandR monitors).
-fn frame_interval(x: &X, max_fps: Option<f64>) -> Duration {
-    let fps = max_fps.or_else(|| x.max_refresh()).unwrap_or(60.0);
+/// The shortest time between frames: the user's limit, else the period of
+/// `refresh` (the fastest lit monitor's), else 60 Hz's.
+fn frame_interval(refresh: Option<f64>, max_fps: Option<f64>) -> Duration {
+    let fps = max_fps.or(refresh).unwrap_or(60.0);
     Duration::from_secs_f64(1.0 / fps.max(1.0))
 }
 
@@ -197,7 +225,9 @@ impl Compositor {
         };
         let now = Instant::now();
         let zoom = Zoom::new(x.root_cardinal(x.atoms.screen_zoom, AtomEnum::CARDINAL), now);
-        let min_interval = frame_interval(&x, opts.max_fps);
+        let refresh = x.max_refresh();
+        let min_interval = frame_interval(refresh, opts.max_fps);
+        let saver = x.saver_on();
         let mut c = Compositor {
             vt: x.vt().and_then(Vt::open),
             x,
@@ -226,6 +256,11 @@ impl Compositor {
             unredirected: None,
             quit: false,
             last_frame: None,
+            last_present: None,
+            content: 0,
+            continuous: opts.continuous,
+            lit: refresh.is_some(),
+            saver,
             max_fps: opts.max_fps,
             present_mode: opts.present_mode,
             min_interval,
@@ -240,8 +275,13 @@ impl Compositor {
         c.scene.add_all(&c.x)?;
         let vt = c.vt.as_ref().map(|_| format!(", watching VT {}", c.x.vt().unwrap_or(0))).unwrap_or_default();
         let fps = 1.0 / c.min_interval.as_secs_f64();
+        let every = match &c.gpu {
+            Some(g) if c.continuous && g.keeps_newest() => ", presenting at every refresh",
+            Some(_) if c.continuous => ", presenting on changes only (FIFO would queue every refresh's present)",
+            _ => "",
+        };
         log::info!(
-            "composing {} top-level windows on a {}x{} screen, up to {fps:.0} fps{vt}",
+            "composing {} top-level windows on a {}x{} screen, up to {fps:.0} fps{every}{vt}",
             c.wins.len(),
             c.x.width,
             c.x.height
@@ -435,11 +475,20 @@ impl Compositor {
                     self.rebuild_gpu("new screen size")?;
                 }
             }
-            Event::RandrNotify(_) if self.max_fps.is_none() => {
-                let interval = frame_interval(&self.x, None);
-                if interval != self.min_interval {
-                    log::info!("monitors changed: up to {:.0} fps", 1.0 / interval.as_secs_f64());
-                    self.min_interval = interval;
+            Event::RandrNotify(_) => {
+                let refresh = self.x.max_refresh();
+                let interval = frame_interval(refresh, self.max_fps);
+                if interval != self.min_interval || refresh.is_some() != self.lit {
+                    let lit = if refresh.is_some() { "" } else { ", none lit" };
+                    log::info!("monitors changed: up to {:.0} fps{lit}", 1.0 / interval.as_secs_f64());
+                    (self.min_interval, self.lit) = (interval, refresh.is_some());
+                }
+            }
+            Event::ScreensaverNotify(e) => {
+                let on = matches!(e.state, screensaver::State::ON | screensaver::State::CYCLE);
+                if on != self.saver {
+                    log::info!("screen saver {}", if on { "on" } else { "off" });
+                    self.saver = on;
                 }
             }
             Event::ConfigureNotify(e) => {
@@ -618,6 +667,39 @@ impl Compositor {
         self.scene.dirty || self.full_present || self.zoom.animating() || self.view() != self.shown
     }
 
+    /// Whether to present at every refresh: with Vulkan, while compositing, on
+    /// a lit monitor the screen saver has not blanked and on the X server's VT.
+    /// A variable-refresh monitor then stays at its top rate instead of
+    /// following the desktop's pauses.
+    fn continuous_now(&self) -> bool {
+        self.continuous
+            && self.gpu.as_ref().is_some_and(Gpu::keeps_newest)
+            && self.unredirected.is_none()
+            && self.lit
+            && !self.saver
+            && self.vt.as_ref().is_none_or(Vt::ours)
+    }
+
+    /// When the next frame is due, if one is: once something changed, at most
+    /// at the frame limit, and while continuous, a refresh after the last
+    /// present. A present that only keeps up with the refresh never delays a
+    /// frame with news, which supersedes it if both wait for the same vblank.
+    fn next_frame(&self, now: Instant) -> Option<Instant> {
+        if self.unredirected.is_some() {
+            return None;
+        }
+        let continuous = self.continuous_now();
+        let pace = if continuous { self.min_interval.mul_f64(CONTINUOUS_PACE) } else { self.min_interval };
+        let after = |last: Option<Instant>| Some(last.map_or(now, |t| t + pace));
+        if self.wants_frame() {
+            after(self.last_frame)
+        } else if continuous {
+            after(self.last_present)
+        } else {
+            None
+        }
+    }
+
     /// Follows the pointer while zoomed: on raw motion, at most once a frame, or
     /// by polling where X has no XInput 2. Returns when to look again.
     fn track_pointer(&mut self, now: Instant) -> Result<Option<Duration>> {
@@ -642,17 +724,23 @@ impl Compositor {
     }
 
     /// Draws a frame, or returns how soon to try again when the Vulkan side has
-    /// no image free yet; damage meanwhile merges into that frame.
+    /// no image free yet; damage meanwhile merges into that frame. A frame
+    /// with nothing new costs the X server nothing.
     fn frame(&mut self, now: Instant) -> Result<Option<Duration>> {
+        let news = self.wants_frame();
+        let painted = self.scene.dirty;
         if let Some(gpu) = &mut self.gpu {
-            if !gpu.scene_free()? || !gpu.acquire()? {
+            if (painted && !gpu.scene_free()?) || !gpu.acquire()? {
                 let since = *self.blocked_since.get_or_insert(now);
-                // No vblanks for a while (monitor off): look less often.
-                let late = now - since > Duration::from_millis(50);
-                return Ok(Some(Duration::from_millis(if late { 20 } else { 1 })));
+                let retry = match (now - since > NO_VBLANKS, news) {
+                    (false, _) => Duration::from_millis(1),
+                    (true, true) => NO_VBLANKS_RETRY,
+                    (true, false) => NO_VBLANKS_IDLE_RETRY,
+                };
+                return Ok(Some(retry));
             }
             if let Some(since) = self.blocked_since.take() {
-                self.stats.no_image += 1;
+                self.stats.no_image += news as u32;
                 if now - since >= NO_IMAGE_LOG {
                     log::info!("no free swapchain image for {} ms", (now - since).as_millis());
                 }
@@ -662,36 +750,46 @@ impl Compositor {
             bind(&self.x, &self.scene, w)?;
         }
         let view = self.view();
-        let painted = self.scene.dirty;
+        if painted || self.full_present || view != self.shown {
+            self.content += 1;
+        }
         if painted {
             self.scene.paint(&self.x, &self.background, self.wins.iter())?;
+            self.stats.composed += 1;
         }
         if let Some(gpu) = &mut self.gpu {
-            self.scene.clear_damage(&self.x)?;
-            let start = Instant::now();
-            if !painted {
-            } else if self.x.sync_gpu(self.fence, FENCE_LIMIT)? {
-                self.stats.fence_sum += start.elapsed();
-                self.stats.fence_max = self.stats.fence_max.max(start.elapsed());
-            } else {
-                // Its trigger may be lost for good; draw anyway, with a new fence.
-                if self.stats.fence_timeouts == 0 {
-                    log::warn!("the X server's fence did not trigger within {} ms", FENCE_LIMIT.as_millis());
+            if painted {
+                self.scene.clear_damage(&self.x)?;
+                let start = Instant::now();
+                if self.x.sync_gpu(self.fence, FENCE_LIMIT)? {
+                    self.stats.fence_sum += start.elapsed();
+                    self.stats.fence_max = self.stats.fence_max.max(start.elapsed());
+                } else {
+                    // Its trigger may be lost for good; draw anyway, with a new fence.
+                    if self.stats.fence_timeouts == 0 {
+                        log::warn!("the X server's fence did not trigger within {} ms", FENCE_LIMIT.as_millis());
+                    }
+                    self.stats.fence_timeouts += 1;
+                    self.x.conn.sync_destroy_fence(self.fence)?;
+                    self.fence = self.x.create_fence()?;
+                    self.scene.add_all(&self.x)?;
                 }
-                self.stats.fence_timeouts += 1;
-                self.x.conn.sync_destroy_fence(self.fence)?;
-                self.fence = self.x.create_fence()?;
-                self.scene.add_all(&self.x)?;
             }
-            gpu.draw(view.unwrap_or(View::IDENTITY), self.linear)?;
+            if gpu.draw(view.unwrap_or(View::IDENTITY), self.linear, self.content)? {
+                self.stats.drawn += 1;
+            }
         } else {
             let full = self.full_present || view != self.shown;
             let filter: &[u8] = if self.linear { b"bilinear" } else { b"nearest" };
             self.scene.present(&self.x, self.overlay_picture, view, filter, full)?;
             self.scene.clear_damage(&self.x)?;
+            self.stats.drawn += 1;
         }
         self.x.conn.flush()?;
-        (self.shown, self.full_present, self.last_frame) = (view, false, Some(now));
+        (self.shown, self.full_present, self.last_present) = (view, false, Some(now));
+        if news {
+            self.last_frame = Some(now);
+        }
         self.stats.frames += 1;
         Ok(None)
     }
@@ -717,12 +815,14 @@ impl Compositor {
         }
         let s = std::mem::take(&mut self.stats);
         log::debug!(
-            "{} frames in {:.0} s, {} waited for a free image; X's GPU work took {:.2} ms a frame on average, \
-             at most {:.2} ms; {} fence timeouts; {} damage events",
+            "{} frames in {:.0} s, {} composed, {} drawn, {} waited for a free image; X's GPU work took {:.2} ms \
+             a composition on average, at most {:.2} ms; {} fence timeouts; {} damage events",
             s.frames,
             (now - self.stats_since).as_secs_f64(),
+            s.composed,
+            s.drawn,
             s.no_image,
-            s.fence_sum.as_secs_f64() * 1e3 / s.frames.max(1) as f64,
+            s.fence_sum.as_secs_f64() * 1e3 / s.composed.max(1) as f64,
             s.fence_max.as_secs_f64() * 1e3,
             s.fence_timeouts,
             s.damage_events
@@ -765,10 +865,9 @@ impl Compositor {
             if let Some(d) = self.update_redirection(now)? {
                 wake(d);
             }
-            if self.unredirected.is_none() && self.wants_frame() {
-                let rested = self.last_frame.map_or(Duration::MAX, |t| now - t);
-                if rested < self.min_interval {
-                    wake(self.min_interval - rested);
+            if let Some(due) = self.next_frame(now) {
+                if due > now {
+                    wake(due - now);
                 } else if let Some(d) = self.frame_or_recover(now)? {
                     wake(d);
                 } else {

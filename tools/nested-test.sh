@@ -1,7 +1,8 @@
 #!/bin/bash
 # End-to-end test of rxcom on a nested Xvfb. The composited screen is compared
 # with the X server's own rendering, ARGB blending and the zoom mapping are
-# checked numerically, a full-screen window must get the screen to itself, and
+# checked numerically, the Vulkan presenter must present at every refresh while
+# idle without drawing, a full-screen window must get the screen to itself, and
 # shutdown must leave the screen as found, also after the X server stalled.
 #
 #   CARGO_TARGET_DIR=... tools/nested-test.sh [display number, default 23]
@@ -78,6 +79,37 @@ check grep -q "another compositor is running" <("$bin/rxcom" 2>&1)
 echo "2. ARGB windows blend as premultiplied alpha"
 check python3 "$here/argbcheck.py" "$out/ref_below.png" "$out/plain.png" 300,250,300,200 80800000
 check python3 "$here/argbcheck.py" "$out/ref_below.png" "$out/plain.png" 1100,300,500,160 c0004080
+
+echo "2b. idle, the Vulkan presenter presents at every refresh and draws nothing new"
+if grep -q "presenting at every refresh" "$out/rxcom.log"; then
+	# The first statistics cover rxcom's first 10 s, idle but for its start.
+	t0=$(awk '{print $14 + $15}' "/proc/$rx/stat")
+	for _ in $(seq 100); do grep -q "frames in" "$out/rxcom.log" && break; sleep 0.2; done
+	t1=$(awk '{print $14 + $15}' "/proc/$rx/stat")
+	echo "   rxcom's CPU meanwhile: $(((t1 - t0) * 1000 / $(getconf CLK_TCK))) ms"
+	check python3 - "$(grep -m1 "frames in" "$out/rxcom.log")" \
+		"$(grep -o "up to [0-9]* fps" "$out/rxcom.log" | head -1)" <<'PY'
+import re
+import sys
+m = re.search(r"(\d+) frames in (\d+) s, (\d+) composed, (\d+) drawn", sys.argv[1])
+frames, secs, composed, drawn = map(int, m.groups())
+fps = int(re.search(r"\d+", sys.argv[2]).group())
+print(f"   {frames} frames in {secs} s at {fps} Hz: {composed} composed, {drawn} drawn")
+# Each change is drawn into each of the (at most 4) swapchain images once.
+sys.exit(0 if frames >= 0.95 * fps * secs and drawn <= 4 * (composed + 1) else 1)
+PY
+else
+	echo "   skipped: the X server presents"
+fi
+echo "   the screen saver pauses that, and the screen comes back as it was:"
+xset s activate
+sleep 0.5
+check grep -q "screen saver on" "$out/rxcom.log"
+xset s reset
+sleep 0.5
+check grep -q "screen saver off" "$out/rxcom.log"
+shot saver_off
+check python3 "$here/compare.py" "$out/plain.png" "$out/saver_off.png"
 
 echo "3. zoom 2x and 4x around the pointer, then back (nearest, pixel-exact)"
 xdotool mousemove 400 330
@@ -305,9 +337,9 @@ check test "$status" -eq 0
 sleep 0.5
 shot ref_after
 check python3 "$here/compare.py" "$out/ref_after.png" "$out/before_exit.png" --ignore 1100,300,500,160
-echo "   the selection is free again; a new instance with --zoom-filter linear, at 3x:"
+echo "   the selection is free again; a new instance with --zoom-filter linear and FIFO, at 3x:"
 xdotool mousemove 700 400
-"$bin/rxcom" --zoom-filter linear >"$out/rxcom2.log" 2>&1 &
+"$bin/rxcom" --zoom-filter linear --present-mode fifo >"$out/rxcom2.log" 2>&1 &
 rx=$!
 sleep 1.5
 shot unzoomed2
@@ -321,11 +353,15 @@ kill -TERM "$rx"
 wait "$rx"
 rx=
 check grep -q "released the screen" "$out/rxcom2.log"
-echo "   SIGTERM is honoured while frames render back to back:"
+if grep -q "presenting at every refresh" "$out/rxcom.log"; then
+	echo "   with FIFO it presents only on changes, since FIFO would queue every refresh's present:"
+	check grep -q "presenting on changes only" "$out/rxcom2.log"
+fi
+echo "   SIGTERM is honoured while frames render back to back (presenting only on changes):"
 "$bin/examples/argbwin" --geometry 600x80+200+950 --depth 32 --color ff00a0ff --animate --name anim2 &
 anim2=$!
 pids+=($anim2)
-"$bin/rxcom" >"$out/rxcom3.log" 2>&1 &
+"$bin/rxcom" --no-continuous >"$out/rxcom3.log" 2>&1 &
 rx=$!
 sleep 1.5
 start=$(date +%s%N)
