@@ -3,18 +3,20 @@
 //!
 //!   argbwin [--geometry WxH+X+Y] [--depth 32|24] [--color AARRGGBB]
 //!           [--pattern solid|gradient|quadrants] [--animate] [--name NAME]
-//!           [--override-redirect]
+//!           [--override-redirect] [--border N] [--blink]
 //!
 //! Colours are premultiplied ARGB. `gradient` ramps alpha from 0 at the left to
 //! the colour's alpha at the right; `quadrants` paints four opaque colours;
-//! `--animate` moves an opaque bar to produce damage every 50 ms.
+//! `--animate` moves an opaque bar to produce damage every 50 ms; `--blink`
+//! switches the colour of the X border (`--border`, green at first) between
+//! green and magenta every 50 ms, the way a window manager marks focus.
 
 use anyhow::{Context, Result, bail};
 use std::time::{Duration, Instant};
 use x11rb::connection::Connection;
 use x11rb::protocol::Event;
 use x11rb::protocol::xproto::{
-    AtomEnum, ColormapAlloc, ConnectionExt as _, CreateGCAux, CreateWindowAux, EventMask, ImageFormat, PropMode,
+    AtomEnum, ChangeWindowAttributesAux, ColormapAlloc, ConnectionExt as _, CreateGCAux, CreateWindowAux, EventMask, ImageFormat, PropMode,
     VisualClass, WindowClass,
 };
 use x11rb::wrapper::ConnectionExt as _;
@@ -30,6 +32,8 @@ struct Args {
     animate: bool,
     name: String,
     override_redirect: bool,
+    border: u16,
+    blink: bool,
 }
 
 fn parse() -> Result<Args> {
@@ -44,6 +48,8 @@ fn parse() -> Result<Args> {
         animate: false,
         name: "argbwin".into(),
         override_redirect: false,
+        border: 0,
+        blink: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
@@ -62,11 +68,16 @@ fn parse() -> Result<Args> {
             "--animate" => a.animate = true,
             "--name" => a.name = v()?,
             "--override-redirect" => a.override_redirect = true,
+            "--border" => a.border = v()?.parse()?,
+            "--blink" => a.blink = true,
             _ => bail!("unknown option {k}"),
         }
     }
     Ok(a)
 }
+
+/// The X border's two colours, opaque green and magenta.
+const BORDER: [u32; 2] = [0xff00c000, 0xffc000c0];
 
 fn pixel(a: &Args, (w, h): (u16, u16), x: u32, y: u32) -> u32 {
     match a.pattern.as_str() {
@@ -112,12 +123,12 @@ fn main() -> Result<()> {
         a.y,
         a.w,
         a.h,
-        0,
+        a.border,
         WindowClass::INPUT_OUTPUT,
         visual,
         &CreateWindowAux::new()
             .background_pixel(0)
-            .border_pixel(0)
+            .border_pixel(BORDER[0])
             .colormap(cmap)
             .override_redirect(a.override_redirect as u32)
             .event_mask(EventMask::EXPOSURE | EventMask::STRUCTURE_NOTIFY),
@@ -163,10 +174,17 @@ fn main() -> Result<()> {
                 _ => {}
             }
         }
-        if a.animate && Instant::now() >= next {
+        if (a.animate || a.blink) && Instant::now() >= next {
             let t = start.elapsed().as_millis() as u32 / 50;
-            let span = size.0.saturating_sub(20).max(1) as u32;
-            draw(size, Some((t * 8 % span) as u16))?;
+            if a.animate {
+                let span = size.0.saturating_sub(20).max(1) as u32;
+                draw(size, Some((t * 8 % span) as u16))?;
+            }
+            if a.blink {
+                let aux = ChangeWindowAttributesAux::new().border_pixel(BORDER[t as usize % 2]);
+                conn.change_window_attributes(win, &aux)?;
+                conn.flush()?;
+            }
             next += Duration::from_millis(50);
         }
         std::thread::sleep(Duration::from_millis(5));

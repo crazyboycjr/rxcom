@@ -2,40 +2,38 @@ use anyhow::{Context, Result, bail};
 use rxcom::compositor::{Compositor, Options};
 use std::os::fd::RawFd;
 use std::process::ExitCode;
+use std::time::Duration;
 
 const USAGE: &str = "\
-rxcom: an X11 compositor on Vulkan
+rxcom: an X11 compositor with a desktop zoom
 
 usage: rxcom [options]
-  -d, --display NAME    X display (default $DISPLAY)
-  --gpu NAME            use the Vulkan device whose name contains NAME
-  --no-dri3             copy window contents through MIT-SHM even when DRI3 works
-  --no-sync-fence       sample DRI3 windows without waiting on an X Sync fence
-  --max-fps N           upper bound on the frame rate (default 240)
-  --background RRGGBB   colour when no root pixmap is set (default 303030)
-  --validation          enable the Vulkan validation layers
-  -v, -vv               more logging (or RXCOM_LOG=debug)
+  -d, --display NAME      X display (default $DISPLAY)
+  --unredirect-delay MS   give the screen to a full-screen opaque window
+                          (a game) after MS milliseconds (default 200)
+  --no-unredirect         always composite
+  --zoom-filter F         nearest (default) or linear
+  --max-fps N             frame rate limit without vblank pacing (default 240)
+  --background RRGGBB     colour where no wallpaper is set (default 303030)
+  -v, -vv                 more logging (or RXCOM_LOG=debug)
   -h, --help
 
-Zoom: set the root property _PICOM_ZOOM (CARDINAL/32, 16.16 fixed point), e.g.
-  xprop -root -f _PICOM_ZOOM 32c -set _PICOM_ZOOM 131072   # 2x
+Zoom: the window manager sets the root property _PICOM_ZOOM (CARDINAL/32,
+16.16 fixed point), as for picom-zoom; for example 2x, then off:
+  xprop -root -f _PICOM_ZOOM 32c -set _PICOM_ZOOM 131072
+  xprop -root -remove _PICOM_ZOOM
 ";
 
-fn parse_color(s: &str) -> Result<[f32; 4]> {
-    let v = u32::from_str_radix(s.trim_start_matches('#'), 16).context("colour must be RRGGBB")?;
-    let c = |shift: u32| ((v >> shift) & 0xff) as f32 / 255.0;
-    Ok([c(16), c(8), c(0), 1.0])
-}
+/// Stops rxcom if one turn of its loop takes longer than this.
+const WATCHDOG: Duration = Duration::from_secs(5);
 
 fn parse_args() -> Result<(Options, u8)> {
     let mut o = Options {
         display: None,
-        gpu: std::env::var("RXCOM_GPU").ok(),
-        dri3: true,
-        sync_fence: true,
-        validation: false,
+        unredirect_delay: Some(Duration::from_millis(200)),
+        zoom_filter: b"nearest",
         max_fps: 240.0,
-        background: parse_color("303030")?,
+        background: 0x303030,
     };
     let mut verbose = 0;
     let mut args = std::env::args().skip(1);
@@ -43,12 +41,22 @@ fn parse_args() -> Result<(Options, u8)> {
         let mut value = || args.next().with_context(|| format!("{a} needs a value"));
         match a.as_str() {
             "-d" | "--display" => o.display = Some(value()?),
-            "--gpu" => o.gpu = Some(value()?),
-            "--no-dri3" => o.dri3 = false,
-            "--no-sync-fence" => o.sync_fence = false,
+            "--unredirect-delay" => {
+                o.unredirect_delay = Some(Duration::from_millis(value()?.parse().context("--unredirect-delay")?))
+            }
+            "--no-unredirect" => o.unredirect_delay = None,
+            "--zoom-filter" => {
+                o.zoom_filter = match value()?.as_str() {
+                    "nearest" => b"nearest",
+                    "linear" | "bilinear" => b"bilinear",
+                    f => bail!("--zoom-filter: {f} is neither nearest nor linear"),
+                }
+            }
             "--max-fps" => o.max_fps = value()?.parse().context("--max-fps")?,
-            "--background" => o.background = parse_color(&value()?)?,
-            "--validation" => o.validation = true,
+            "--background" => {
+                let v = value()?;
+                o.background = u32::from_str_radix(v.trim_start_matches('#'), 16).context("--background RRGGBB")?;
+            }
             "-v" => verbose += 1,
             "-vv" => verbose += 2,
             "-h" | "--help" => {
@@ -62,7 +70,7 @@ fn parse_args() -> Result<(Options, u8)> {
 }
 
 /// Blocks SIGINT, SIGTERM and SIGHUP and returns a signalfd that reports them.
-/// Runs before Vulkan starts any driver threads, so they inherit the mask.
+/// Runs before any other thread starts, so they all inherit the mask.
 fn signal_fd() -> Result<RawFd> {
     unsafe {
         let mut set: libc::sigset_t = std::mem::zeroed();
@@ -91,6 +99,7 @@ fn main() -> ExitCode {
     };
     rxcom::logger::init(verbose);
     let result = signal_fd().and_then(|sigfd| {
+        rxcom::watchdog::start(WATCHDOG);
         let mut c = Compositor::new(&opts)?;
         c.run(sigfd)
     });

@@ -1,16 +1,16 @@
 #!/bin/bash
 # End-to-end test of rxcom on a nested Xvfb. The composited screen is compared
 # with the X server's own rendering, ARGB blending and the zoom mapping are
-# checked numerically, and shutdown must leave the screen as found.
+# checked numerically, a full-screen window must get the screen to itself, and
+# shutdown must leave the screen as found, also after the X server stalled.
 #
 #   CARGO_TARGET_DIR=... tools/nested-test.sh [display number, default 23]
 #
 # With RXCOM_TEST_EXTERNAL=1 the display must already be running (for example
-# tools/xwayland.sh) and is left running.
+# tools/xwayland.sh) and is left running; the stall check is skipped there.
 #
 # Build first: cargo build --all-targets. Screenshots and logs go to
-# $RXCOM_SCRATCH/shots/run (default ~/.cache/claude-scratch/rxcom). Vulkan
-# runs on the NVIDIA driver unless VK_DRIVER_FILES says otherwise; the real
+# $RXCOM_SCRATCH/shots/run (default ~/.cache/claude-scratch/rxcom). The real
 # display is never touched.
 set -uo pipefail
 n=${1:-23}
@@ -19,7 +19,6 @@ scratch=${RXCOM_SCRATCH:-$HOME/.cache/claude-scratch/rxcom}
 out=$scratch/shots/run
 bin=${CARGO_TARGET_DIR:-$here/../target}/debug
 export DISPLAY=:$n
-export VK_DRIVER_FILES=${VK_DRIVER_FILES:-/usr/share/vulkan/icd.d/nvidia_icd.json}
 mkdir -p "$out"
 rm -f "$out"/*.png "$out"/*.log
 
@@ -47,6 +46,9 @@ xterm -geometry 80x20+1200+80 -fa Monospace -fs 11 -bg '#1d2021' -fg '#ebdbb2' -
 pids+=($!)
 "$bin/examples/argbwin" --geometry 400x300+100+100 --depth 24 --pattern quadrants --name quad24 &
 pids+=($!)
+# An X border, as xmonad draws them.
+"$bin/examples/argbwin" --geometry 200x100+600+80 --depth 24 --color ff808080 --border 4 --name bordered &
+pids+=($!)
 sleep 1.5
 shot ref_below
 "$bin/examples/argbwin" --geometry 300x200+300+250 --depth 32 --color 80800000 --name argb50 &
@@ -62,7 +64,7 @@ xdotool windowfocus "$(xdotool search --name '^quad24$')"
 sleep 0.3
 shot ref_plain
 
-"$bin/rxcom" -v --validation >"$out/rxcom.log" 2>&1 &
+"$bin/rxcom" -v >"$out/rxcom.log" 2>&1 &
 rx=$!
 sleep 2
 
@@ -77,7 +79,7 @@ echo "2. ARGB windows blend as premultiplied alpha"
 check python3 "$here/argbcheck.py" "$out/ref_below.png" "$out/plain.png" 300,250,300,200 80800000
 check python3 "$here/argbcheck.py" "$out/ref_below.png" "$out/plain.png" 1100,300,500,160 c0004080
 
-echo "3. zoom 2x and 4x around the pointer, then back"
+echo "3. zoom 2x and 4x around the pointer, then back (nearest, pixel-exact)"
 xdotool mousemove 400 330
 sleep 0.3
 shot zoom1
@@ -93,12 +95,18 @@ xprop -root -f _PICOM_ZOOM 32c -set _PICOM_ZOOM 262144
 sleep 1
 shot zoom4x
 check python3 "$here/zoomcheck.py" "$out/zoom1.png" "$out/zoom4x.png" 4 1290 125
-echo "   16x (the property asks for 30518x, clamped to 16x):"
-xdotool mousemove 300 250
+echo "   16x at the screen's corner (the property asks for 30518x, clamped to 16x):"
+xdotool mousemove 1919 0
 xprop -root -f _PICOM_ZOOM 32c -set _PICOM_ZOOM 2000000000
 sleep 1.5
 shot zoom16x
-check python3 "$here/zoomcheck.py" "$out/zoom1.png" "$out/zoom16x.png" 16 300 250
+check python3 "$here/zoomcheck.py" "$out/zoom1.png" "$out/zoom16x.png" 16 1919 0
+echo "   2.5x, between whole pixels:"
+xdotool mousemove 300 250
+xprop -root -f _PICOM_ZOOM 32c -set _PICOM_ZOOM 163840
+sleep 1
+shot zoom2_5x
+check python3 "$here/zoomcheck.py" "$out/zoom1.png" "$out/zoom2_5x.png" 2.5 300 250
 xprop -root -remove _PICOM_ZOOM
 sleep 1
 shot unzoomed
@@ -119,6 +127,21 @@ echo "   argb50 over the moved and resized window:"
 check python3 "$here/argbcheck.py" "$out/raised.png" "$out/moved.png" 900,650,300,200 80800000
 
 echo "5. damage: an animating client keeps updating"
+bar_moved() {
+	python3 - "$1" "$2" "$3" <<'PY'
+import sys
+import numpy as np
+from PIL import Image
+row = int(sys.argv[3])
+rows = [np.asarray(Image.open(p).convert("RGB")).astype(int)[row] for p in sys.argv[1:3]]
+def bar(r):
+    x = np.nonzero((r[:, 0] == 255) & (r[:, 1] == 255) & (r[:, 2] == 0))[0]
+    return int(x.min()) if len(x) else None
+b = [bar(r) for r in rows]
+print(f"   bar at x={b[0]}, then x={b[1]}")
+sys.exit(0 if None not in b and b[0] != b[1] else 1)
+PY
+}
 "$bin/examples/argbwin" --geometry 600x80+200+950 --depth 32 --color ff00a0ff --pattern gradient \
 	--animate --name anim &
 anim=$!
@@ -127,22 +150,74 @@ sleep 1
 shot anim1
 sleep 0.5
 shot anim2
-check python3 - "$out/anim1.png" "$out/anim2.png" <<'PY'
+check bar_moved "$out/anim1.png" "$out/anim2.png" 990
+kill "$anim"
+echo "   an X border changing colour, as xmonad's focus does, is redrawn:"
+"$bin/examples/argbwin" --geometry 300x60+1300+700 --depth 24 --color ff808080 --border 5 --blink --name blink &
+blink=$!
+pids+=($blink)
+sleep 1
+# Uneven gaps, so the shots do not alias with the 50 ms blinking.
+for gap in 0.13 0.07 0.19 0.11 0.23 0.05; do shot "blink$gap"; sleep "$gap"; done
+check python3 - "$out"/blink0.*.png <<'PY'
 import sys
 import numpy as np
 from PIL import Image
-rows = [np.asarray(Image.open(p).convert("RGB")).astype(int)[990, 200:800] for p in sys.argv[1:3]]
-def bar(r):
-    x = np.nonzero((r[:, 0] == 255) & (r[:, 1] == 255) & (r[:, 2] == 0))[0]
-    return int(x.min()) + 200 if len(x) else None
-b = [bar(r) for r in rows]
-print(f"   bar at x={b[0]}, then x={b[1]}")
-sys.exit(0 if None not in b and b[0] != b[1] else 1)
+seen = set()
+for p in sys.argv[1:]:
+    a = np.asarray(Image.open(p).convert("RGB")).astype(int)
+    # The border's four sides, 5 pixels wide around 300x60+1305+705.
+    sides = [a[700:705, 1300:1610], a[765:770, 1300:1610], a[700:770, 1300:1305], a[700:770, 1605:1610]]
+    colours = {tuple(c) for s in sides for c in s.reshape(-1, 3)}
+    if len(colours) != 1 or not colours <= {(0, 0xC0, 0), (0xC0, 0, 0xC0)}:
+        print(f"   {p}: border colours {colours}")
+        sys.exit(1)
+    seen |= colours
+print(f"   border colours seen: {sorted(seen)}")
+sys.exit(0 if len(seen) == 2 else 1)
 PY
-kill "$anim"
+kill "$blink"
 sleep 0.5
 
-echo "6. SIGTERM shuts down cleanly and leaves the screen as found"
+echo "6. a full-screen opaque window gets the screen after 200 ms, and gives it back"
+"$bin/examples/argbwin" --geometry 1920x1080+0+0 --depth 24 --color ff406080 --animate \
+	--override-redirect --name fullscreen &
+fs=$!
+pids+=($fs)
+sleep 1
+check grep -q "unredirecting the screen for the full-screen window" "$out/rxcom.log"
+echo "   the window draws to the screen itself (rxcom shows no frames now):"
+shot fs1
+sleep 0.4
+shot fs2
+check bar_moved "$out/fs1.png" "$out/fs2.png" 540
+echo "   zooming composites again, and the screen goes back to the window after the zoom:"
+xprop -root -f _PICOM_ZOOM 32c -set _PICOM_ZOOM 131072
+sleep 0.5
+check test "$(grep -c "compositing again" "$out/rxcom.log")" -eq 1
+xprop -root -remove _PICOM_ZOOM
+sleep 1
+check test "$(grep -c "unredirecting the screen" "$out/rxcom.log")" -eq 2
+"$bin/examples/argbwin" --geometry 300x200+100+100 --depth 24 --color ffc08000 --override-redirect --name popup &
+popup=$!
+pids+=($popup)
+sleep 1
+check test "$(grep -c "compositing again" "$out/rxcom.log")" -eq 2
+shot popup
+check python3 - "$out/popup.png" <<'PY'
+import sys
+import numpy as np
+from PIL import Image
+a = np.asarray(Image.open(sys.argv[1]).convert("RGB")).astype(int)
+inside = a[100:300, 100:400]
+ok = (inside == [0xc0, 0x80, 0]).all()
+print(f"   popup composited above the full-screen window: {ok}")
+sys.exit(0 if ok else 1)
+PY
+kill "$popup" "$fs"
+sleep 0.7
+
+echo "7. SIGTERM shuts down cleanly and leaves the screen as found"
 shot before_exit
 kill -TERM "$rx"
 wait "$rx"
@@ -153,17 +228,26 @@ check test "$status" -eq 0
 sleep 0.5
 shot ref_after
 check python3 "$here/compare.py" "$out/ref_after.png" "$out/before_exit.png" --ignore 1100,300,500,160
-"$bin/rxcom" >"$out/rxcom2.log" 2>&1 &
+echo "   the selection is free again; a new instance with --zoom-filter linear, at 3x:"
+xdotool mousemove 700 400
+"$bin/rxcom" --zoom-filter linear >"$out/rxcom2.log" 2>&1 &
 rx=$!
 sleep 1.5
+shot unzoomed2
+xprop -root -f _PICOM_ZOOM 32c -set _PICOM_ZOOM 196608
+sleep 1
+shot zoom3x_linear
+check python3 "$here/zoomcheck.py" "$out/unzoomed2.png" "$out/zoom3x_linear.png" 3 700 400 linear
+xprop -root -remove _PICOM_ZOOM
+sleep 0.5
 kill -TERM "$rx"
 wait "$rx"
 rx=
-echo "   the selection is free again (a new instance starts and stops):"
 check grep -q "released the screen" "$out/rxcom2.log"
 echo "   SIGTERM is honoured while frames render back to back:"
 "$bin/examples/argbwin" --geometry 600x80+200+950 --depth 32 --color ff00a0ff --animate --name anim2 &
-pids+=($!)
+anim2=$!
+pids+=($anim2)
 "$bin/rxcom" >"$out/rxcom3.log" 2>&1 &
 rx=$!
 sleep 1.5
@@ -174,11 +258,39 @@ status=$?
 rx=
 echo "   exited with status $status after $((($(date +%s%N) - start) / 1000000)) ms"
 check grep -q "released the screen" "$out/rxcom3.log"
+kill "$anim2"
 
-echo "7. no Vulkan validation messages, warnings or errors in the log"
-# A pixmap the server cannot export (Xwayland's root pixmap, compressed modifiers)
-# falls back to MIT-SHM copies with one warning; that is handled, not a failure.
-problems=$(grep -E 'vulkan:|WARN|ERROR' "$out/rxcom.log" | grep -v 'DRI3 import of pixmap')
+if [ -z "$external" ]; then
+	echo "8. the X server stops answering for 7 s mid-zoom: the watchdog warns, rxcom"
+	echo "   waits it out and carries on"
+	"$bin/rxcom" >"$out/rxcom4.log" 2>&1 &
+	rx=$!
+	sleep 1.5
+	shot before_hang
+	# Zoomed, rxcom asks for the pointer every 4 ms, so it is soon waiting on X.
+	xprop -root -f _PICOM_ZOOM 32c -set _PICOM_ZOOM 131072
+	sleep 0.5
+	xpid=$(cat "$scratch/xvfb$n.pid")
+	kill -STOP "$xpid"
+	sleep 7
+	kill -CONT "$xpid"
+	sleep 0.5
+	check kill -0 "$rx"
+	check grep -q "the X server has not answered for" "$out/rxcom4.log"
+	xprop -root -remove _PICOM_ZOOM
+	sleep 1
+	shot after_hang
+	check python3 "$here/compare.py" "$out/before_hang.png" "$out/after_hang.png" --ignore 1100,300,500,160
+	kill -TERM "$rx"
+	wait "$rx"
+	status=$?
+	rx=
+	echo "   then exits with status $status on SIGTERM"
+	check test "$status" -eq 0
+fi
+
+echo "9. no warnings or errors in the log"
+problems=$(grep -E 'WARN|ERROR' "$out/rxcom.log")
 echo "$problems" | head -5
 check test -z "$problems"
 

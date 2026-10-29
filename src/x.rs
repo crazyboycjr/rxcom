@@ -1,18 +1,18 @@
 //! The X side: connection, extensions, the compositing manager selection, the
-//! overlay window, and small request helpers.
+//! overlay window, picture formats and small request helpers.
 
 use anyhow::{Context, Result, anyhow, bail};
+use std::collections::HashMap;
 use std::ffi::CString;
 use x11rb::connection::{Connection, RequestConnection};
 use x11rb::protocol::composite::{self, ConnectionExt as _};
 use x11rb::protocol::damage::{self, ConnectionExt as _};
-use x11rb::protocol::dri3::{self, ConnectionExt as _};
-use x11rb::protocol::shape;
-use x11rb::protocol::shm::{self, ConnectionExt as _};
-use x11rb::protocol::sync::{self, ConnectionExt as _};
+use x11rb::protocol::present::{self, ConnectionExt as _};
+use x11rb::protocol::render::{self, ConnectionExt as _, PictType};
+use x11rb::protocol::shape::{self, ConnectionExt as _};
 use x11rb::protocol::xfixes::ConnectionExt as _;
 use x11rb::protocol::xproto::{
-    AtomEnum, ConnectionExt as _, CreateWindowAux, EventMask, GetGeometryReply,
+    AtomEnum, ChangeWindowAttributesAux, ConnectionExt as _, CreateWindowAux, EventMask, GetGeometryReply,
     GetWindowAttributesReply, PropMode, Window, WindowClass,
 };
 use x11rb::wrapper::ConnectionExt as _;
@@ -25,16 +25,14 @@ pub struct Atoms {
     pub picom_zoom: u32,
     pub net_wm_name: u32,
     pub utf8_string: u32,
+    pub xfree86_vt: u32,
 }
 
-/// Optional extensions and what they allow.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Features {
-    /// DRI3 1.2: BuffersFromPixmap with explicit modifiers.
-    pub dri3: bool,
-    /// MIT-SHM 1.2: segments passed as file descriptors.
-    pub shm_fd: bool,
-    pub sync: bool,
+/// A picture format and whether it carries alpha.
+#[derive(Clone, Copy, Debug)]
+pub struct Format {
+    pub id: u32,
+    pub alpha: bool,
 }
 
 pub struct X {
@@ -42,11 +40,13 @@ pub struct X {
     pub screen: usize,
     pub root: Window,
     pub root_visual: u32,
-    pub root_depth: u8,
     pub width: u16,
     pub height: u16,
     pub atoms: Atoms,
-    pub features: Features,
+    visual_formats: HashMap<u32, Format>,
+    depth_formats: HashMap<u8, Format>,
+    /// The Present extension, for pacing frames to the vblank.
+    pub present: bool,
     /// Owns the _NET_WM_CM_Sn selection.
     pub owner: Window,
     pub overlay: Window,
@@ -62,8 +62,7 @@ impl X {
         let (conn, screen) = XCBConnection::connect(name.as_deref())
             .with_context(|| format!("cannot open display {}", display.unwrap_or("$DISPLAY")))?;
         let s = &conn.setup().roots[screen];
-        let (root, root_visual, root_depth, width, height) =
-            (s.root, s.root_visual, s.root_depth, s.width_in_pixels, s.height_in_pixels);
+        let (root, root_visual, width, height) = (s.root, s.root_visual, s.width_in_pixels, s.height_in_pixels);
 
         let v = conn.composite_query_version(0, 4)?.reply().context("no Composite extension")?;
         if (v.major_version, v.minor_version) < (0, 3) {
@@ -71,20 +70,44 @@ impl X {
         }
         conn.damage_query_version(1, 1)?.reply().context("no DAMAGE extension")?;
         conn.xfixes_query_version(5, 0)?.reply().context("no XFIXES extension")?;
+        let v = conn.render_query_version(0, 11)?.reply().context("no RENDER extension")?;
+        if (v.major_version, v.minor_version) < (0, 6) {
+            bail!("RENDER {}.{} is too old, need 0.6", v.major_version, v.minor_version);
+        }
+        conn.shape_query_version()?.reply().context("no SHAPE extension")?;
+        let present = conn.extension_information(present::X11_EXTENSION_NAME)?.is_some()
+            && conn.present_query_version(1, 0)?.reply().is_ok();
 
-        let mut features = Features::default();
-        if conn.extension_information(dri3::X11_EXTENSION_NAME)?.is_some() {
-            let v = conn.dri3_query_version(1, 2)?.reply()?;
-            features.dri3 = (v.major_version, v.minor_version) >= (1, 2);
-            log::debug!("DRI3 {}.{}", v.major_version, v.minor_version);
+        let pf = conn.render_query_pict_formats()?.reply()?;
+        let alpha_of: HashMap<u32, bool> = pf
+            .formats
+            .iter()
+            .filter(|f| f.type_ == PictType::DIRECT)
+            .map(|f| (f.id, f.direct.alpha_mask != 0))
+            .collect();
+        let mut visual_formats = HashMap::new();
+        for d in &pf.screens[screen].depths {
+            for v in &d.visuals {
+                if let Some(&alpha) = alpha_of.get(&v.format) {
+                    visual_formats.insert(v.visual, Format { id: v.format, alpha });
+                }
+            }
         }
-        if conn.extension_information(shm::X11_EXTENSION_NAME)?.is_some() {
-            let v = conn.shm_query_version()?.reply()?;
-            features.shm_fd = (v.major_version, v.minor_version) >= (1, 2);
+        // Pixmaps have no visual; pick the standard formats by depth.
+        let mut depth_formats = HashMap::new();
+        for f in pf.formats.iter().filter(|f| f.type_ == PictType::DIRECT) {
+            let d = &f.direct;
+            let standard = match f.depth {
+                24 => d.alpha_mask == 0 && (d.red_shift, d.green_shift, d.blue_shift) == (16, 8, 0),
+                32 => d.alpha_mask == 0xff && (d.alpha_shift, d.red_shift, d.green_shift, d.blue_shift) == (24, 16, 8, 0),
+                _ => false,
+            };
+            if standard {
+                depth_formats.insert(f.depth, Format { id: f.id, alpha: d.alpha_mask != 0 });
+            }
         }
-        if conn.extension_information(sync::X11_EXTENSION_NAME)?.is_some() {
-            conn.sync_initialize(3, 1)?.reply()?;
-            features.sync = true;
+        if !visual_formats.contains_key(&root_visual) {
+            bail!("no picture format for the root visual");
         }
 
         let atoms = Atoms {
@@ -94,20 +117,34 @@ impl X {
             picom_zoom: intern(&conn, "_PICOM_ZOOM")?,
             net_wm_name: intern(&conn, "_NET_WM_NAME")?,
             utf8_string: intern(&conn, "UTF8_STRING")?,
+            xfree86_vt: intern(&conn, "XFree86_VT")?,
         };
         Ok(X {
             conn,
             screen,
             root,
             root_visual,
-            root_depth,
             width,
             height,
             atoms,
-            features,
+            visual_formats,
+            depth_formats,
+            present,
             owner: x11rb::NONE,
             overlay: x11rb::NONE,
         })
+    }
+
+    pub fn visual_format(&self, visual: u32) -> Option<Format> {
+        self.visual_formats.get(&visual).copied()
+    }
+
+    pub fn depth_format(&self, depth: u8) -> Option<Format> {
+        self.depth_formats.get(&depth).copied()
+    }
+
+    pub fn root_format(&self) -> Format {
+        self.visual_formats[&self.root_visual]
     }
 
     /// Takes the compositing manager selection, redirects all top-level windows and
@@ -132,7 +169,7 @@ impl X {
             0,
             WindowClass::INPUT_ONLY,
             0,
-            &CreateWindowAux::new().override_redirect(1).event_mask(EventMask::PROPERTY_CHANGE),
+            &CreateWindowAux::new().override_redirect(1),
         )?
         .check()?;
         c.change_property8(PropMode::REPLACE, w, AtomEnum::WM_NAME, AtomEnum::STRING, b"rxcom")?;
@@ -157,16 +194,34 @@ impl X {
         c.xfixes_create_region(region, &[])?;
         c.xfixes_set_window_shape_region(self.overlay, shape::SK::INPUT, 0, 0, region)?;
         c.xfixes_destroy_region(region)?;
+        c.change_window_attributes(self.overlay, &ChangeWindowAttributesAux::new().event_mask(EventMask::EXPOSURE))?;
 
         c.change_window_attributes(
             self.root,
-            &x11rb::protocol::xproto::ChangeWindowAttributesAux::new().event_mask(
+            &ChangeWindowAttributesAux::new().event_mask(
                 EventMask::SUBSTRUCTURE_NOTIFY | EventMask::STRUCTURE_NOTIFY | EventMask::PROPERTY_CHANGE,
             ),
         )?
         .check()
         .context("cannot select SubstructureNotify on the root")?;
         c.flush()?;
+        Ok(())
+    }
+
+    /// Hands the screen back to the windows, for a full-screen window that does
+    /// not need compositing: they draw to the screen directly again.
+    pub fn unredirect(&self) -> Result<()> {
+        self.conn.composite_unredirect_subwindows(self.root, composite::Redirect::MANUAL)?;
+        self.conn.unmap_window(self.overlay)?;
+        Ok(())
+    }
+
+    pub fn redirect(&self) -> Result<()> {
+        self.conn
+            .composite_redirect_subwindows(self.root, composite::Redirect::MANUAL)?
+            .check()
+            .context("cannot redirect the root's children again")?;
+        self.conn.map_window(self.overlay)?;
         Ok(())
     }
 
@@ -219,6 +274,12 @@ impl X {
         Some((a.reply().ok()?, g.reply().ok()?))
     }
 
+    /// Whether the window's bounding region is not its plain rectangle.
+    pub fn bounding_shaped(&self, w: Window) -> bool {
+        let r = self.conn.shape_query_extents(w).ok().and_then(|c| c.reply().ok());
+        r.is_some_and(|r| r.bounding_shaped)
+    }
+
     /// Reads a single 32-bit value of a root property.
     pub fn root_cardinal(&self, atom: u32, ty: impl Into<u32>) -> Option<u32> {
         let r = self.conn.get_property(false, self.root, atom, ty, 0, 1).ok()?.reply().ok()?;
@@ -241,30 +302,32 @@ impl X {
         Ok(d)
     }
 
-    pub fn pointer(&self) -> Option<(i16, i16)> {
+    pub fn pointer(&self) -> Option<[i16; 2]> {
         let r = self.conn.query_pointer(self.root).ok()?.reply().ok()?;
-        Some((r.root_x, r.root_y))
+        Some([r.root_x, r.root_y])
     }
 
-    pub fn create_fence(&self) -> Result<u32> {
-        let f = self.conn.generate_id()?;
-        self.conn.sync_create_fence(self.root, f, false)?.check()?;
-        Ok(f)
+    /// The VT the X server runs on, which Xorg announces on the root window.
+    pub fn vt(&self) -> Option<u32> {
+        self.root_cardinal(self.atoms.xfree86_vt, AtomEnum::INTEGER)
     }
 
-    /// Waits until the X server has finished all rendering queued so far, the way
-    /// picom's xrender-sync-fence does: trigger a fence, wait for it, round trip.
-    pub fn fence_sync(&self, fence: u32) -> Result<()> {
-        let c = &self.conn;
-        c.sync_trigger_fence(fence)?;
-        c.sync_await_fence(&[fence])?;
-        c.sync_reset_fence(fence)?;
-        c.get_input_focus()?.reply()?;
+    /// Asks for a PresentCompleteNotify event on the overlay at its next vblank.
+    pub fn select_present(&self) -> Result<()> {
+        let eid = self.conn.generate_id()?;
+        self.conn.present_select_input(eid, self.overlay, present::EventMask::COMPLETE_NOTIFY)?;
         Ok(())
     }
 
-    pub fn buffers_from_pixmap(&self, pixmap: u32) -> Result<dri3::BuffersFromPixmapReply> {
-        Ok(self.conn.dri3_buffers_from_pixmap(pixmap)?.reply()?)
+    pub fn notify_next_vblank(&self, serial: u32) -> Result<()> {
+        self.conn.present_notify_msc(self.overlay, serial, 0, 1, 0)?;
+        Ok(())
+    }
+
+    pub fn create_picture(&self, drawable: u32, format: Format) -> Result<u32> {
+        let p = self.conn.generate_id()?;
+        self.conn.render_create_picture(p, drawable, format.id, &render::CreatePictureAux::new())?;
+        Ok(p)
     }
 }
 
@@ -273,6 +336,6 @@ pub fn error_is_benign(e: &x11rb::x11_utils::X11Error) -> bool {
     use x11rb::protocol::ErrorKind as K;
     matches!(
         e.error_kind,
-        K::Window | K::Drawable | K::Pixmap | K::Match | K::DamageBadDamage | K::Value
+        K::Window | K::Drawable | K::Pixmap | K::Match | K::DamageBadDamage | K::Value | K::RenderPicture
     )
 }

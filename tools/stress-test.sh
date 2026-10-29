@@ -2,9 +2,9 @@
 # Stress test on a nested Xvfb with a reparenting window manager (openbox with
 # its stock config, never the user's): random moves, resizes, raises,
 # iconifies, withdraws (the window manager hands the client back to the root),
-# kills, zoom changes and wallpaper changes while rxcom runs with the Vulkan
-# validation layers. Afterwards the composited screen must equal the server's
-# own rendering and the log must hold no warnings or validation messages.
+# kills, zoom changes and wallpaper changes while rxcom runs. Afterwards the
+# composited screen must equal the server's own rendering and the log must
+# hold no warnings or errors.
 #
 #   CARGO_TARGET_DIR=... tools/stress-test.sh [display number] [steps]
 set -uo pipefail
@@ -15,7 +15,6 @@ scratch=${RXCOM_SCRATCH:-$HOME/.cache/claude-scratch/rxcom}
 out=$scratch/shots/stress
 bin=${CARGO_TARGET_DIR:-$here/../target}/debug
 export DISPLAY=:$n
-export VK_DRIVER_FILES=${VK_DRIVER_FILES:-/usr/share/vulkan/icd.d/nvidia_icd.json}
 mkdir -p "$out" "$scratch/xdg"
 rm -f "$out"/*.png "$out"/*.log
 RANDOM=42
@@ -36,7 +35,7 @@ feh --no-fehbg --bg-tile "$out/wall1.png"
 XDG_CONFIG_HOME=$scratch/xdg openbox --config-file /etc/xdg/openbox/rc.xml >"$out/openbox.log" 2>&1 &
 pids+=($!)
 sleep 1
-"$bin/rxcom" -v --validation >"$out/rxcom.log" 2>&1 &
+"$bin/rxcom" -v >"$out/rxcom.log" 2>&1 &
 rx=$!
 sleep 1.5
 
@@ -93,7 +92,7 @@ import -window root "$out/composited.png"
 rss_end=$(awk '/VmRSS/ {print $2}' /proc/"$rx"/status)
 echo "rxcom RSS: $rss_start kB after start-up, $rss_end kB after the run"
 echo "windows added $(grep -c ' add 0x' "$out/rxcom.log"), forgotten $(grep -c 'forget 0x' "$out/rxcom.log");" \
-	"zoom targets $(grep -c 'zoom target' "$out/rxcom.log"); backgrounds $(grep -c 'background pixmap' "$out/rxcom.log")"
+	"zoom targets $(grep -c 'zoom target' "$out/rxcom.log"); backgrounds $(grep -c "background: root pixmap" "$out/rxcom.log")"
 kill -TERM "$rx"
 wait "$rx"
 status=$?
@@ -103,6 +102,6 @@ import -window root "$out/uncomposited.png"
 echo "rxcom exit status $status"
 python3 "$here/compare.py" "$out/uncomposited.png" "$out/composited.png"
 same=$?
-problems=$(grep -E "vulkan:|WARN|ERROR" "$out/rxcom.log")
-echo "${problems:-no warnings, errors or validation messages in the log}" | head -10
+problems=$(grep -E "WARN|ERROR" "$out/rxcom.log")
+echo "${problems:-no warnings or errors in the log}" | head -10
 [ "$status" -eq 0 ] && [ "$same" -eq 0 ] && [ -z "$problems" ]

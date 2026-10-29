@@ -1,93 +1,85 @@
 //! The compositor: X events in, frames out.
 
-use crate::gpu::present::Swapchain;
-use crate::gpu::render::{Quad, Renderer};
-use crate::gpu::texture::{DmaBuf, Texture};
-use crate::gpu::{Buffer, Gpu, GpuOptions, image_barrier};
-use crate::shm::ImageReader;
-use crate::windows::{Geometry, Source, Win, WinList};
+use crate::scene::{Background, Scene};
+use crate::vt::Vt;
+use crate::watchdog;
+use crate::windows::{Geometry, Win, WinList};
 use crate::x::{X, error_is_benign};
-use crate::zoom::Zoom;
+use crate::zoom::{View, Zoom};
 use anyhow::{Context, Result};
-use ash::vk;
-use std::collections::VecDeque;
-use std::ffi::CString;
-use std::mem::ManuallyDrop;
 use std::os::fd::{AsRawFd, RawFd};
 use std::time::{Duration, Instant};
+use x11rb::NONE;
 use x11rb::connection::Connection;
 use x11rb::protocol::Event;
 use x11rb::protocol::composite::ConnectionExt as _;
 use x11rb::protocol::damage::ConnectionExt as _;
+use x11rb::protocol::render::ConnectionExt as _;
+use x11rb::protocol::shape::{self, ConnectionExt as _};
+use x11rb::protocol::xfixes::ConnectionExt as _;
 use x11rb::protocol::xproto::{
     AtomEnum, ConnectionExt as _, GetGeometryReply, GetWindowAttributesReply, MapState, Place, Property, Window,
     WindowClass,
 };
-use x11rb::xcb_ffi::XCBConnection;
 
 pub struct Options {
     pub display: Option<String>,
-    pub gpu: Option<String>,
-    pub dri3: bool,
-    pub sync_fence: bool,
-    pub validation: bool,
+    /// Unredirect a full-screen opaque window after this long; None: never.
+    pub unredirect_delay: Option<Duration>,
+    /// The XRender filter for the zoom, "nearest" or "bilinear".
+    pub zoom_filter: &'static [u8],
     pub max_fps: f64,
-    pub background: [f32; 4],
+    pub background: u32,
 }
 
-const FRAMES: usize = 2;
-/// How often the pointer is polled while zoomed and idle.
-const POINTER_POLL: Duration = Duration::from_millis(8);
+/// How often the pointer is polled while zoomed, as picom-zoom does.
+const POINTER_POLL: Duration = Duration::from_millis(4);
+/// How long a frame waits for the vblank before it goes out anyway: without
+/// vblanks (monitor off, VT away) frames keep coming, just slowly.
+const VBLANK_TIMEOUT: Duration = Duration::from_millis(50);
+const STATS_EVERY: Duration = Duration::from_secs(10);
 
-struct Frame {
-    cmd: vk::CommandBuffer,
-    fence: vk::Fence,
-    acquired: vk::Semaphore,
-    staging: Option<Buffer>,
-    /// The last frame number submitted in this slot (0: none).
-    number: u64,
-}
-
-enum Garbage {
-    Texture(Texture),
-    Buffer(Buffer),
-}
-
-struct Background {
-    pixmap: u32,
-    tex: Texture,
-    source: Source,
-    dirty: bool,
+#[derive(Default)]
+struct Stats {
+    frames: u32,
+    vblanks: u32,
+    vblank_timeouts: u32,
+    /// Time from asking for the next vblank until it came, summed and worst.
+    wait_sum: Duration,
+    wait_max: Duration,
+    since: Option<Instant>,
 }
 
 pub struct Compositor {
     x: X,
-    /// The libxcb connection the Vulkan surface presents through, kept open for
-    /// the surface's lifetime. A separate one, so the driver's presentation
-    /// traffic never interleaves with our events.
-    _wsi: XCBConnection,
-    gpu: ManuallyDrop<Gpu>,
-    renderer: Renderer,
-    swapchain: Option<Swapchain>,
-    /// The scene composed 1:1, sampled by the zoom pass.
-    scene: Option<Texture>,
-    frames: Vec<Frame>,
-    frame_no: u64,
-    completed: u64,
-    garbage: VecDeque<(u64, Garbage)>,
     wins: WinList,
-    reader: ImageReader,
-    background: Option<Background>,
-    clear: [f32; 4],
+    scene: Scene,
+    background: Background,
+    overlay_picture: u32,
     zoom: Zoom,
-    pointer: (i16, i16),
-    fence: Option<u32>,
-    use_dri3: bool,
-    dirty: bool,
+    filter: &'static [u8],
+    pointer: [i16; 2],
+    next_pointer_poll: Instant,
+    /// The zoom view on screen (None: unzoomed).
+    shown: Option<View>,
+    /// The overlay lost its contents (exposed, remapped, VT switch): copy everything.
+    full_present: bool,
+    /// The outstanding NotifyMSC, and when it was sent. Only one at a time, so
+    /// none pile up in the X server while no vblank comes.
+    pending_msc: Option<(u32, Instant)>,
+    /// A vblank has just passed.
+    vblank_due: bool,
+    serial: u32,
+    unredirect_delay: Option<Duration>,
+    /// A full-screen window that may get the screen, and since when.
+    candidate: Option<(Window, Instant)>,
+    /// The window the screen is unredirected for.
+    unredirected: Option<Window>,
+    vt: Option<Vt>,
     quit: bool,
     last_frame: Option<Instant>,
     min_interval: Duration,
-    warned_dri3: bool,
+    stats: Stats,
 }
 
 /// Reads one signal from the non-blocking signalfd, if any arrived.
@@ -105,204 +97,167 @@ impl Compositor {
     pub fn new(opts: &Options) -> Result<Compositor> {
         let mut x = X::connect(opts.display.as_deref())?;
         x.become_compositor()?;
-        let mut c = match Self::with_x(x, opts) {
-            Ok(c) => c,
-            Err(failed) => {
-                let (mut x, e) = *failed;
+        let setup = (|| -> Result<_> { Ok((Scene::new(&x)?, x.create_picture(x.overlay, x.root_format())?)) })();
+        let (scene, overlay_picture) = match setup {
+            Ok(v) => v,
+            Err(e) => {
                 x.release_compositor();
                 return Err(e);
             }
+        };
+        let now = Instant::now();
+        let zoom = Zoom::new(x.root_cardinal(x.atoms.picom_zoom, AtomEnum::CARDINAL), now);
+        let mut c = Compositor {
+            vt: x.vt().and_then(Vt::open),
+            x,
+            wins: WinList::new(),
+            scene,
+            background: Background::new(opts.background),
+            overlay_picture,
+            zoom,
+            filter: opts.zoom_filter,
+            pointer: [0, 0],
+            next_pointer_poll: now,
+            shown: None,
+            full_present: true,
+            pending_msc: None,
+            vblank_due: false,
+            serial: 0,
+            unredirect_delay: opts.unredirect_delay,
+            candidate: None,
+            unredirected: None,
+            quit: false,
+            last_frame: None,
+            min_interval: Duration::from_secs_f64(1.0 / opts.max_fps.max(1.0)),
+            stats: Stats::default(),
         };
         // From here on Drop undoes everything, including the X state.
         c.init()?;
         Ok(c)
     }
 
-    /// Builds everything after the X setup; on failure hands the X state back so
-    /// the caller can undo it.
-    fn with_x(x: X, opts: &Options) -> std::result::Result<Compositor, Box<(X, anyhow::Error)>> {
-        let setup = (|| -> Result<_> {
-            let name = opts.display.as_deref().map(CString::new).transpose()?;
-            let (wsi, _) = XCBConnection::connect(name.as_deref()).context("second X connection for Vulkan")?;
-            let use_dri3 = opts.dri3 && x.features.dri3;
-            let gpu = Gpu::new(&GpuOptions {
-                present: Some((wsi.get_raw_xcb_connection(), x.overlay)),
-                want_dmabuf: use_dri3,
-                device_filter: opts.gpu.as_deref(),
-                validation: opts.validation,
-            })?;
-            Ok((wsi, gpu))
-        })();
-        let (wsi, gpu) = match setup {
-            Ok(v) => v,
-            Err(e) => return Err(Box::new((x, e))),
-        };
-        let use_dri3 = opts.dri3 && x.features.dri3 && gpu.mem_fd.is_some();
-        let gpu = ManuallyDrop::new(gpu);
-        let rest = (|| -> Result<_> {
-            let extent = vk::Extent2D { width: x.width as u32, height: x.height as u32 };
-            let swapchain = Swapchain::new(&gpu, extent, None)?;
-            let renderer = Renderer::new(&gpu, swapchain.format)?;
-            let mut frames = Vec::new();
-            for _ in 0..FRAMES {
-                let cmd = unsafe {
-                    gpu.device.allocate_command_buffers(
-                        &vk::CommandBufferAllocateInfo::default()
-                            .command_pool(gpu.cmd_pool)
-                            .level(vk::CommandBufferLevel::PRIMARY)
-                            .command_buffer_count(1),
-                    )?[0]
-                };
-                let fence = unsafe {
-                    gpu.device
-                        .create_fence(&vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED), None)?
-                };
-                let acquired = unsafe { gpu.device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None)? };
-                frames.push(Frame { cmd, fence, acquired, staging: None, number: 0 });
-            }
-            Ok((swapchain, renderer, frames))
-        })();
-        let (swapchain, renderer, frames) = match rest {
-            Ok(v) => v,
-            Err(e) => {
-                ManuallyDrop::into_inner(gpu);
-                return Err(Box::new((x, e)));
-            }
-        };
-        let fence = if use_dri3 && opts.sync_fence && x.features.sync {
-            x.create_fence().ok()
-        } else {
-            None
-        };
-        log::info!(
-            "window contents via {}{}",
-            if use_dri3 { "DRI3 dma-buf import" } else if x.features.shm_fd { "MIT-SHM copies" } else { "GetImage copies" },
-            if fence.is_some() { ", X Sync fence before sampling" } else { "" }
-        );
-        let reader = ImageReader::new(x.features.shm_fd);
-        Ok(Compositor {
-            x,
-            _wsi: wsi,
-            gpu,
-            renderer,
-            swapchain: Some(swapchain),
-            scene: None,
-            frames,
-            frame_no: 1,
-            completed: 0,
-            garbage: VecDeque::new(),
-            wins: WinList::new(),
-            reader,
-            background: None,
-            clear: opts.background,
-            zoom: Zoom::new(),
-            pointer: (0, 0),
-            fence,
-            use_dri3,
-            dirty: true,
-            quit: false,
-            last_frame: None,
-            min_interval: Duration::from_secs_f64(1.0 / opts.max_fps.max(1.0)),
-            warned_dri3: false,
-        })
-    }
-
     fn init(&mut self) -> Result<()> {
-        self.create_scene()?;
-        for (w, attrs, geom) in self.x.scan()? {
-            self.add_window(w, &attrs, &geom);
+        if self.x.present {
+            self.x.select_present()?;
         }
-        log::info!("{} top-level windows", self.wins.len());
-        self.refresh_background();
-        let z = Zoom::from_property(self.x.root_cardinal(self.x.atoms.picom_zoom, AtomEnum::CARDINAL));
-        self.zoom.set_target(z, Instant::now());
+        for (w, attrs, geom) in self.x.scan()? {
+            self.add_window(w, &attrs, &geom)?;
+        }
+        self.background.set(&self.x, self.x.root_pixmap())?;
+        self.scene.add_all(&self.x)?;
+        log::info!(
+            "composing {} top-level windows with XRender on a {}x{} screen; presenting with the X server{}{}",
+            self.wins.len(),
+            self.x.width,
+            self.x.height,
+            if self.x.present { ", paced by Present" } else { "" },
+            match &self.vt {
+                Some(_) => format!(", watching VT {}", self.x.vt().unwrap_or(0)),
+                None => String::new(),
+            }
+        );
         self.x.conn.flush()?;
         Ok(())
     }
 
-    fn create_scene(&mut self) -> Result<()> {
-        if let Some(old) = self.scene.take() {
-            self.defer(Garbage::Texture(old));
-        }
-        let sc = self.swapchain.as_ref().unwrap();
-        self.scene = Some(self.gpu.create_texture(
-            sc.extent.width,
-            sc.extent.height,
-            sc.format,
-            vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
-            false,
-        )?);
-        Ok(())
-    }
-
-    fn defer(&mut self, g: Garbage) {
-        self.garbage.push_back((self.frame_no, g));
-    }
-
-    fn collect_garbage(&mut self) {
-        while let Some((n, _)) = self.garbage.front() {
-            if *n > self.completed + 1 {
-                break;
-            }
-            match self.garbage.pop_front().unwrap().1 {
-                Garbage::Texture(t) => t.destroy(&self.gpu),
-                Garbage::Buffer(b) => b.destroy(&self.gpu),
-            }
-        }
-    }
-
-    fn add_window(&mut self, id: Window, attrs: &GetWindowAttributesReply, geom: &GetGeometryReply) {
-        let mut w = Win::new(id, geometry(geom), geom.depth);
+    fn add_window(&mut self, id: Window, attrs: &GetWindowAttributesReply, geom: &GetGeometryReply) -> Result<()> {
+        let mut w = Win::new(id, geometry(geom), attrs.visual);
         w.input_only = attrs.class == WindowClass::INPUT_ONLY;
-        w.override_redirect = attrs.override_redirect;
         w.ignored = id == self.x.overlay || id == self.x.owner;
         w.mapped = attrs.map_state != MapState::UNMAPPED;
         if !w.input_only && !w.ignored {
             w.damage = self.x.create_damage(id).ok();
+            self.x.conn.shape_select_input(id, true)?;
+            w.shaped = self.x.bounding_shaped(id);
         }
-        if w.mapped {
-            w.pixmap_stale = true;
-            self.dirty = true;
+        if w.drawable() {
+            w.stale = true;
+            self.scene.add_rect(&self.x, w.geom.outer())?;
         }
         log::debug!(
-            "add 0x{id:x} {}x{}+{}+{} depth {}{}{}",
+            "add 0x{id:x} {}x{}+{}+{} visual 0x{:x}{}{}{}",
             w.geom.width,
             w.geom.height,
             w.geom.x,
             w.geom.y,
-            w.depth,
+            w.visual,
             if w.mapped { " mapped" } else { "" },
+            if w.shaped { " shaped" } else { "" },
             if w.ignored { " (ignored)" } else { "" }
         );
         self.wins.insert_top(w);
+        Ok(())
     }
 
-    /// Frees what an unmapped window no longer needs; the damage object stays.
-    fn release_contents(&mut self, id: Window) {
+    /// Frees the window's pixmap and picture; the damage object stays.
+    fn release_picture(&mut self, id: Window) {
         let Some(w) = self.wins.get_mut(id) else { return };
-        let pixmap = w.pixmap.take();
-        let tex = w.tex.take();
-        w.source = None;
-        if let Some(p) = pixmap {
-            let _ = self.x.conn.free_pixmap(p).map(|c| c.ignore_error());
+        if let Some(p) = w.picture.take() {
+            let _ = self.x.conn.render_free_picture(p);
         }
-        if let Some(t) = tex {
-            self.defer(Garbage::Texture(t));
+        if let Some(p) = w.pixmap.take() {
+            let _ = self.x.conn.free_pixmap(p);
         }
     }
 
-    fn forget_window(&mut self, id: Window, destroyed: bool) {
-        self.release_contents(id);
+    fn forget_window(&mut self, id: Window, destroyed: bool) -> Result<()> {
+        self.release_picture(id);
         if let Some(w) = self.wins.remove(id) {
             if let (Some(d), false) = (w.damage, destroyed) {
                 // A destroyed window took its damage object with it.
-                let _ = self.x.conn.damage_destroy(d).map(|c| c.ignore_error());
+                let _ = self.x.conn.damage_destroy(d);
             }
             if w.drawable() {
-                self.dirty = true;
+                self.scene.add_rect(&self.x, w.geom.outer())?;
             }
             log::debug!("forget 0x{id:x}");
         }
+        Ok(())
+    }
+
+    /// Names the window's pixmap and puts a picture on it, clipped to its
+    /// bounding shape when it has one. Errors (the window went away meanwhile)
+    /// come back as events and are ignored; its events are on the way.
+    fn bind(&mut self, id: Window) -> Result<()> {
+        self.release_picture(id);
+        let x = &self.x;
+        let Some(w) = self.wins.get_mut(id) else { return Ok(()) };
+        let pixmap = x.conn.generate_id()?;
+        x.conn.composite_name_window_pixmap(id, pixmap)?;
+        let format = x.visual_format(w.visual).unwrap_or(x.root_format());
+        let picture = x.create_picture(pixmap, format)?;
+        if w.shaped {
+            let region = x.conn.generate_id()?;
+            x.conn.xfixes_create_region_from_window(region, id, shape::SK::BOUNDING)?;
+            // The region starts at the window's inside, the pixmap at its border.
+            let b = w.geom.border as i16;
+            x.conn.xfixes_translate_region(region, b, b)?;
+            x.conn.xfixes_set_picture_clip_region(picture, region, 0, 0)?;
+            x.conn.xfixes_destroy_region(region)?;
+        }
+        w.pixmap = Some(pixmap);
+        w.picture = Some(picture);
+        w.alpha = format.alpha;
+        w.stale = false;
+        Ok(())
+    }
+
+    fn damaged(&mut self, damage: u32, drawable: Window) -> Result<()> {
+        log::trace!("damage on 0x{drawable:x}");
+        match self.wins.get(drawable) {
+            Some(w) if self.unredirected.is_none() && w.drawable() && !w.stale => {
+                // The region starts at the window's inside; a repainted border
+                // (xmonad's focus colour) lies at negative coordinates.
+                let b = w.geom.border as i16;
+                let (dx, dy) = (w.geom.x + b, w.geom.y + b);
+                self.scene.add_window_damage(&self.x, damage, dx, dy)?;
+            }
+            // Not on screen, or about to be redrawn whole anyway.
+            _ => {
+                self.x.conn.damage_subtract(damage, NONE, NONE)?;
+            }
+        }
+        Ok(())
     }
 
     fn handle(&mut self, ev: Event) -> Result<()> {
@@ -310,51 +265,55 @@ impl Compositor {
         match ev {
             Event::CreateNotify(e) if e.parent == root => {
                 if let Some((a, g)) = self.x.query_window(e.window) {
-                    self.add_window(e.window, &a, &g);
+                    self.add_window(e.window, &a, &g)?;
                 }
             }
-            Event::DestroyNotify(e) => self.forget_window(e.window, true),
+            Event::DestroyNotify(e) => self.forget_window(e.window, true)?,
             Event::MapNotify(e) => {
                 if let Some(w) = self.wins.get_mut(e.window) {
                     w.mapped = true;
-                    w.pixmap_stale = true;
-                    self.dirty |= w.drawable();
+                    w.stale = true;
+                    if w.drawable() {
+                        let r = w.geom.outer();
+                        self.scene.add_rect(&self.x, r)?;
+                    }
                 }
             }
             Event::UnmapNotify(e) => {
                 if let Some(w) = self.wins.get_mut(e.window) {
-                    self.dirty |= w.drawable();
+                    let (was, r) = (w.drawable(), w.geom.outer());
                     w.mapped = false;
-                    self.release_contents(e.window);
+                    self.release_picture(e.window);
+                    if was {
+                        self.scene.add_rect(&self.x, r)?;
+                    }
                 }
             }
-            Event::ConfigureNotify(e) if e.window == root => {
-                log::info!("screen resized to {}x{}", e.width, e.height);
-                self.x.width = e.width;
-                self.x.height = e.height;
-                self.recreate_swapchain()?;
-            }
+            Event::ConfigureNotify(e) if e.window == root => self.resize_screen(e.width, e.height)?,
             Event::ConfigureNotify(e) => {
-                if let Some(w) = self.wins.get_mut(e.window) {
-                    let g = Geometry { x: e.x, y: e.y, width: e.width, height: e.height, border: e.border_width };
-                    if g.outer_size() != w.geom.outer_size() && w.mapped {
-                        w.pixmap_stale = true;
-                    }
-                    w.geom = g;
-                    w.override_redirect = e.override_redirect;
-                    self.dirty |= w.drawable();
-                    if !self.wins.restack(e.window, e.above_sibling) {
-                        log::debug!("0x{:x} restacked above unknown 0x{:x}", e.window, e.above_sibling);
-                    }
+                let Some(w) = self.wins.get_mut(e.window) else { return Ok(()) };
+                let g = Geometry { x: e.x, y: e.y, width: e.width, height: e.height, border: e.border_width };
+                let (old, new) = (w.geom.outer(), g.outer());
+                if (old.width, old.height, w.geom.border) != (new.width, new.height, g.border) && w.mapped {
+                    w.stale = true;
+                }
+                w.geom = g;
+                let drawable = w.drawable();
+                if !self.wins.restack(e.window, e.above_sibling) {
+                    log::debug!("0x{:x} restacked above unknown 0x{:x}", e.window, e.above_sibling);
+                }
+                if drawable {
+                    self.scene.add_rect(&self.x, old)?;
+                    self.scene.add_rect(&self.x, new)?;
                 }
             }
             Event::ReparentNotify(e) => {
                 if e.parent == root {
                     if let Some((a, g)) = self.x.query_window(e.window) {
-                        self.add_window(e.window, &a, &g);
+                        self.add_window(e.window, &a, &g)?;
                     }
                 } else {
-                    self.forget_window(e.window, false);
+                    self.forget_window(e.window, false)?;
                 }
             }
             Event::CirculateNotify(e) => {
@@ -363,20 +322,32 @@ impl Compositor {
                 } else {
                     self.wins.lower(e.window);
                 }
-                self.dirty = true;
+                if let Some(w) = self.wins.get(e.window).filter(|w| w.drawable()) {
+                    let r = w.geom.outer();
+                    self.scene.add_rect(&self.x, r)?;
+                }
             }
             Event::GravityNotify(e) => {
                 if let Some(w) = self.wins.get_mut(e.window) {
+                    let old = w.geom.outer();
                     w.geom.x = e.x;
                     w.geom.y = e.y;
-                    self.dirty |= w.drawable();
+                    if w.drawable() {
+                        let new = w.geom.outer();
+                        self.scene.add_rect(&self.x, old)?;
+                        self.scene.add_rect(&self.x, new)?;
+                    }
                 }
             }
-            Event::DamageNotify(e) => {
-                self.x.conn.damage_subtract(e.damage, x11rb::NONE, x11rb::NONE)?;
-                if let Some(w) = self.wins.get_mut(e.drawable) {
-                    w.content_dirty = true;
-                    self.dirty |= w.drawable();
+            Event::DamageNotify(e) => self.damaged(e.damage, e.drawable)?,
+            Event::ShapeNotify(e) if e.shape_kind == shape::SK::BOUNDING => {
+                if let Some(w) = self.wins.get_mut(e.affected_window) {
+                    w.shaped = e.shaped;
+                    w.stale |= w.mapped;
+                    if w.drawable() {
+                        let r = w.geom.outer();
+                        self.scene.add_rect(&self.x, r)?;
+                    }
                 }
             }
             Event::PropertyNotify(e) if e.window == root => {
@@ -389,21 +360,40 @@ impl Compositor {
                     };
                     let z = Zoom::from_property(v);
                     log::debug!("zoom target {z:.3}");
-                    self.zoom.set_target(z, Instant::now());
-                    self.dirty = true;
+                    let now = Instant::now();
+                    if !self.zoom.active() {
+                        // The first zoomed frame needs to know where the pointer is.
+                        self.next_pointer_poll = now;
+                    }
+                    self.zoom.set_target(z, now);
                 } else if e.atom == a.xrootpmap_id || e.atom == a.esetroot_pmap_id {
-                    self.refresh_background();
+                    self.background.set(&self.x, self.x.root_pixmap())?;
+                    self.scene.add_all(&self.x)?;
+                }
+            }
+            Event::Expose(e) if e.window == self.x.overlay => self.full_present = true,
+            Event::PresentCompleteNotify(e) if e.window == self.x.overlay => {
+                if let Some((serial, asked)) = self.pending_msc
+                    && serial == e.serial
+                {
+                    self.pending_msc = None;
+                    self.vblank_due = true;
+                    let wait = asked.elapsed();
+                    self.stats.wait_sum += wait;
+                    self.stats.wait_max = self.stats.wait_max.max(wait);
+                    self.stats.vblanks += 1;
                 }
             }
             Event::SelectionClear(e) if e.selection == self.x.atoms.cm_selection => {
                 log::warn!("another compositor took over the screen; exiting");
                 // It owns the selection now; we must not touch the overlay or redirection.
-                self.x.owner = x11rb::NONE;
+                self.x.owner = NONE;
+                self.x.overlay = NONE;
                 self.quit = true;
             }
             Event::Error(e) => {
                 if error_is_benign(&e) {
-                    log::debug!("X error {:?} (request {}.{})", e.error_kind, e.major_opcode, e.minor_opcode);
+                    log::trace!("X error {:?} (request {}.{})", e.error_kind, e.major_opcode, e.minor_opcode);
                 } else {
                     log::warn!("X error {:?} (request {}.{})", e.error_kind, e.major_opcode, e.minor_opcode);
                 }
@@ -413,375 +403,157 @@ impl Compositor {
         Ok(())
     }
 
-    fn refresh_background(&mut self) {
-        self.dirty = true;
-        let pixmap = self.x.root_pixmap();
-        if let (Some(bg), Some(p)) = (self.background.as_mut(), pixmap)
-            && bg.pixmap == p {
-                bg.dirty = bg.source == Source::Shm;
-                return;
-            }
-        if let Some(bg) = self.background.take() {
-            self.defer(Garbage::Texture(bg.tex));
+    fn resize_screen(&mut self, width: u16, height: u16) -> Result<()> {
+        if (width, height) == (self.x.width, self.x.height) {
+            return Ok(());
         }
-        let Some(pixmap) = pixmap else {
-            log::info!("no root pixmap; solid background");
-            return;
-        };
-        let Ok(g) = self.x.conn.get_geometry(pixmap).map_err(anyhow::Error::from).and_then(|c| Ok(c.reply()?)) else {
-            log::warn!("root pixmap 0x{pixmap:x} is gone");
-            return;
-        };
-        match self.import_pixmap(pixmap, g.width as u32 + 2 * g.border_width as u32, g.height as u32, g.depth) {
-            Ok((tex, source)) => {
-                log::info!("background pixmap 0x{pixmap:x} {}x{} via {source:?}", tex.width, tex.height);
-                self.background = Some(Background { pixmap, tex, source, dirty: source == Source::Shm });
+        log::info!("screen resized to {width}x{height}");
+        self.x.width = width;
+        self.x.height = height;
+        self.scene.destroy(&self.x);
+        self.scene = Scene::new(&self.x)?;
+        self.repaint_all()
+    }
+
+    /// After a VT switch or an unredirection the overlay's contents are gone, and
+    /// an outstanding NotifyMSC may never complete, so start over.
+    fn repaint_all(&mut self) -> Result<()> {
+        self.scene.add_all(&self.x)?;
+        self.full_present = true;
+        self.pending_msc = None;
+        Ok(())
+    }
+
+    /// The top-most window when it covers the whole screen and nothing shows
+    /// through it, and the zoom is off: then the screen can be its own.
+    fn fullscreen_window(&self) -> Option<Window> {
+        if self.zoom.active() {
+            return None;
+        }
+        let w = self.wins.iter().filter(|w| w.drawable()).last()?;
+        let r = w.geom.outer();
+        let covers = r.x <= 0
+            && r.y <= 0
+            && r.x as i32 + r.width as i32 >= self.x.width as i32
+            && r.y as i32 + r.height as i32 >= self.x.height as i32;
+        let opaque = !w.shaped && !self.x.visual_format(w.visual).is_some_and(|f| f.alpha);
+        (covers && opaque).then_some(w.id)
+    }
+
+    /// Unredirects for a full-screen window once it has been on top for the
+    /// delay, and redirects again as soon as anything else needs compositing.
+    /// Returns how long until the delay ends.
+    fn update_redirection(&mut self, now: Instant) -> Result<Option<Duration>> {
+        let Some(delay) = self.unredirect_delay else { return Ok(None) };
+        let fs = self.fullscreen_window();
+        if let Some(u) = self.unredirected {
+            if fs != Some(u) {
+                self.redirect()?;
             }
-            Err(e) => log::warn!("cannot use the root pixmap: {e:#}"),
+            return Ok(None);
+        }
+        match (fs, self.candidate) {
+            (Some(w), Some((c, since))) if w == c => {
+                let left = delay.saturating_sub(now - since);
+                if left.is_zero() {
+                    self.unredirect(w)?;
+                    return Ok(None);
+                }
+                Ok(Some(left))
+            }
+            (Some(w), _) => {
+                self.candidate = Some((w, now));
+                Ok(Some(delay))
+            }
+            (None, _) => {
+                self.candidate = None;
+                Ok(None)
+            }
         }
     }
 
-    /// Imports a pixmap through DRI3 when possible, else makes a texture that
-    /// CPU copies fill (the caller schedules the first copy).
-    fn import_pixmap(&mut self, pixmap: u32, width: u32, height: u32, depth: u8) -> Result<(Texture, Source)> {
-        if self.use_dri3 {
-            let r = self.x.buffers_from_pixmap(pixmap).and_then(|mut r| {
-                if r.buffers.len() != 1 {
-                    anyhow::bail!("{} planes", r.buffers.len());
-                }
-                self.gpu.import_dmabuf(DmaBuf {
-                    fd: r.buffers.remove(0),
-                    width: r.width as u32,
-                    height: r.height as u32,
-                    stride: r.strides[0],
-                    offset: r.offsets[0],
-                    modifier: r.modifier,
-                    depth: r.depth,
-                    bpp: r.bpp,
-                })
-            });
-            match r {
-                Ok(t) => return Ok((t, Source::DmaBuf)),
-                Err(e) => {
-                    if !self.warned_dri3 {
-                        log::warn!("DRI3 import of pixmap 0x{pixmap:x} failed, copying through MIT-SHM instead: {e:#}");
-                        self.warned_dri3 = true;
-                    } else {
-                        log::debug!("DRI3 import of pixmap 0x{pixmap:x} failed: {e:#}");
-                    }
-                }
-            }
+    fn unredirect(&mut self, w: Window) -> Result<()> {
+        log::info!("unredirecting the screen for the full-screen window 0x{w:x}");
+        let ids: Vec<Window> = self.wins.order().to_vec();
+        for id in ids {
+            self.release_picture(id);
         }
-        if !(depth == 24 || depth == 32) {
-            anyhow::bail!("unsupported depth {depth}");
-        }
-        Ok((self.gpu.create_upload_texture(width, height, depth)?, Source::Shm))
+        self.x.unredirect()?;
+        self.unredirected = Some(w);
+        self.candidate = None;
+        self.vblank_due = false;
+        Ok(())
     }
 
-    /// Names pixmaps for windows that were just mapped or resized.
-    fn refresh_pixmaps(&mut self) {
-        let stale: Vec<Window> = self.wins.iter().filter(|w| w.drawable() && w.pixmap_stale).map(|w| w.id).collect();
+    fn redirect(&mut self) -> Result<()> {
+        log::info!("compositing again");
+        self.x.redirect()?;
+        self.unredirected = None;
+        let ids: Vec<Window> = self.wins.order().to_vec();
+        for id in ids {
+            if let Some(w) = self.wins.get_mut(id) {
+                w.stale = w.mapped;
+            }
+        }
+        self.repaint_all()
+    }
+
+    fn view(&self) -> Option<View> {
+        self.zoom.view([self.scene.width, self.scene.height], self.pointer)
+    }
+
+    fn wants_frame(&self) -> bool {
+        self.scene.dirty || self.full_present || self.zoom.animating() || self.view() != self.shown
+    }
+
+    fn frame(&mut self, now: Instant) -> Result<()> {
+        let stale: Vec<Window> = self.wins.iter().filter(|w| w.drawable() && w.stale).map(|w| w.id).collect();
         for id in stale {
-            self.release_contents(id);
-            let w = self.wins.get_mut(id).unwrap();
-            w.pixmap_stale = false;
-            let depth = w.depth;
-            let Ok(pixmap) = self.x.conn.generate_id() else { continue };
-            let named = self.x.conn.composite_name_window_pixmap(id, pixmap).map(|c| c.check());
-            if !matches!(named, Ok(Ok(()))) {
-                // Unmapped or destroyed meanwhile; its events are on the way.
-                continue;
-            }
-            // The window may have been resized again since the event we know of.
-            let size = self.x.conn.get_geometry(pixmap).ok().and_then(|c| c.reply().ok());
-            let Some(size) = size else { continue };
-            let result = self.import_pixmap(pixmap, size.width as u32, size.height as u32, depth);
-            let w = self.wins.get_mut(id).unwrap();
-            w.pixmap = Some(pixmap);
-            match result {
-                Ok((tex, source)) => {
-                    w.content_dirty = true;
-                    w.source = Some(source);
-                    w.tex = Some(tex);
-                }
-                Err(e) => log::warn!("window 0x{id:x}: {e:#}"),
-            }
+            self.bind(id)?;
         }
-    }
-
-    /// Copies damaged SHM-backed contents into the frame's staging buffer.
-    /// Returns (window or None for the background, buffer offset) per copy.
-    fn gather_uploads(&mut self, slot: usize) -> Result<Vec<(Option<Window>, u64)>> {
-        let align = |n: u64| (n + 255) & !255;
-        let mut jobs: Vec<(Option<Window>, u32, u32, u32)> = Vec::new();
-        if let Some(bg) = &self.background
-            && bg.dirty {
-                jobs.push((None, bg.pixmap, bg.tex.width, bg.tex.height));
-            }
-        for w in self.wins.iter() {
-            if w.drawable() && w.content_dirty && w.source == Some(Source::Shm)
-                && let (Some(p), Some(t)) = (w.pixmap, &w.tex) {
-                    jobs.push((Some(w.id), p, t.width, t.height));
-                }
+        let view = self.view();
+        if self.scene.dirty {
+            self.scene.paint(&self.x, &self.background, self.wins.iter())?;
         }
-        if jobs.is_empty() {
-            return Ok(Vec::new());
-        }
-        let total: u64 = jobs.iter().map(|j| align(j.2 as u64 * j.3 as u64 * 4)).sum();
-        if self.frames[slot].staging.as_ref().is_none_or(|b| b.size < total) {
-            if let Some(old) = self.frames[slot].staging.take() {
-                self.defer(Garbage::Buffer(old));
-            }
-            let size = total.next_power_of_two().max(1 << 22);
-            self.frames[slot].staging = Some(self.gpu.host_buffer(size, vk::BufferUsageFlags::TRANSFER_SRC)?);
-        }
-        let staging = self.frames[slot].staging.as_ref().unwrap();
-        let mut out = Vec::new();
-        let mut offset = 0u64;
-        for (who, pixmap, w, h) in jobs {
-            let len = w as usize * h as usize * 4;
-            let dst = unsafe { staging.ptr.add(offset as usize) };
-            let r = self.reader.read(&self.x.conn, pixmap, w as u16, h as u16, |data| unsafe {
-                std::ptr::copy_nonoverlapping(data.as_ptr(), dst, len);
-            });
-            match r {
-                Ok(()) => {
-                    out.push((who, offset));
-                    offset += align(len as u64);
-                }
-                Err(e) => log::debug!("copy of pixmap 0x{pixmap:x} failed: {e:#}"),
-            }
-        }
-        Ok(out)
-    }
-
-    fn recreate_swapchain(&mut self) -> Result<()> {
-        unsafe { self.gpu.device.device_wait_idle()? };
-        let extent = vk::Extent2D { width: self.x.width as u32, height: self.x.height as u32 };
-        let old = self.swapchain.take();
-        self.swapchain = Some(Swapchain::new(&self.gpu, extent, old)?);
-        self.create_scene()?;
-        self.dirty = true;
+        let full = self.full_present || view != self.shown;
+        self.scene.present(&self.x, self.overlay_picture, view, self.filter, full)?;
+        self.scene.clear_damage(&self.x)?;
+        self.x.conn.flush()?;
+        self.vblank_due = false;
+        self.shown = view;
+        self.full_present = false;
+        self.last_frame = Some(now);
+        self.stats.frames += 1;
+        log::trace!("frame: zoom {:?} pointer {:?}", view.map(|v| v.scale), self.pointer);
         Ok(())
     }
 
-    fn render(&mut self) -> Result<()> {
-        let now = Instant::now();
-        self.zoom.advance(now);
-        let zoomed = self.zoom.active();
-        if zoomed
-            && let Some(p) = self.x.pointer() {
-                self.pointer = p;
-            }
-
-        let slot = (self.frame_no % FRAMES as u64) as usize;
-        let fence = self.frames[slot].fence;
-        unsafe { self.gpu.device.wait_for_fences(&[fence], true, u64::MAX)? };
-        self.completed = self.completed.max(self.frames[slot].number);
-        self.collect_garbage();
-
-        self.refresh_pixmaps();
-        let uploads = self.gather_uploads(slot)?;
-        let dmabuf_damaged = self
-            .wins
-            .iter()
-            .any(|w| w.drawable() && w.content_dirty && w.source == Some(Source::DmaBuf));
-        if let (Some(f), true) = (self.fence, dmabuf_damaged) {
-            self.x.fence_sync(f)?;
+    fn log_stats(&mut self, now: Instant) {
+        let since = *self.stats.since.get_or_insert(now);
+        if now - since < STATS_EVERY {
+            return;
         }
-        for w in self.wins.iter_mut() {
-            w.content_dirty = false;
-        }
-        if let Some(bg) = self.background.as_mut() {
-            bg.dirty = false;
-        }
-
-        let sc = self.swapchain.as_ref().unwrap();
-        let swfn = self.gpu.swapchain_fn.as_ref().unwrap();
-        let acquired = self.frames[slot].acquired;
-        let t_acquire = Instant::now();
-        let index = match unsafe { swfn.acquire_next_image(sc.swapchain, u64::MAX, acquired, vk::Fence::null()) } {
-            Ok((i, _)) => i,
-            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
-                // Pixels copied above are lost with this frame, so copy them again.
-                self.mark_all_dirty();
-                return self.recreate_swapchain();
-            }
-            Err(e) => return Err(e).context("vkAcquireNextImageKHR"),
-        };
-
-        let acquire_ms = t_acquire.elapsed().as_secs_f64() * 1e3;
-        let gpu = &*self.gpu;
-        let dev = &gpu.device;
-        let cmd = self.frames[slot].cmd;
-        unsafe {
-            dev.reset_fences(&[fence])?;
-            dev.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
-            dev.begin_command_buffer(
-                cmd,
-                &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-            )?;
-        }
-        let staging = self.frames[slot].staging.as_ref();
-        for (who, offset) in uploads {
-            let tex = match who {
-                None => self.background.as_mut().map(|b| &mut b.tex),
-                Some(id) => self.wins.get_mut(id).and_then(|w| w.tex.as_mut()),
-            };
-            if let (Some(tex), Some(buf)) = (tex, staging) {
-                gpu.record_upload(cmd, tex, buf, offset);
-            }
-        }
-
-        let mut quads = Vec::new();
-        if let Some(bg) = self.background.as_ref().filter(|b| b.tex.ready) {
-            quads.push(Quad {
-                tex: &bg.tex,
-                x: 0.0,
-                y: 0.0,
-                width: sc.extent.width as f32,
-                height: sc.extent.height as f32,
-                tiled: true,
-                opacity: 1.0,
-            });
-        }
-        for w in self.wins.iter().filter(|w| w.drawable()) {
-            let Some(tex) = w.tex.as_ref().filter(|t| t.ready) else { continue };
-            quads.push(Quad {
-                tex,
-                x: w.geom.x as f32,
-                y: w.geom.y as f32,
-                width: tex.width as f32,
-                height: tex.height as f32,
-                tiled: false,
-                opacity: 1.0,
-            });
-        }
-        let mut external: Vec<&Texture> = Vec::new();
-        for q in quads.iter().filter(|q| q.tex.external) {
-            if !external.iter().any(|t| t.image == q.tex.image) {
-                external.push(q.tex);
-            }
-        }
-        for t in &external {
-            gpu.record_acquire(cmd, t);
-        }
-
-        let image = sc.images[index as usize];
-        let view = sc.views[index as usize];
-        let to_attachment = (
-            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
-            vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-        );
-        image_barrier(
-            gpu,
-            cmd,
-            image,
-            (vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT, vk::AccessFlags2::NONE, vk::ImageLayout::UNDEFINED),
-            to_attachment,
-            None,
-        );
-        if zoomed {
-            let scene = self.scene.as_ref().unwrap();
-            image_barrier(
-                gpu,
-                cmd,
-                scene.image,
-                (vk::PipelineStageFlags2::FRAGMENT_SHADER, vk::AccessFlags2::NONE, vk::ImageLayout::UNDEFINED),
-                to_attachment,
-                None,
+        let s = std::mem::take(&mut self.stats);
+        if s.frames > 0 {
+            log::debug!(
+                "{} frames in {:.1} s; {} vblanks, waited for on average {:.2} ms, at most {:.2} ms; \
+                 {} frames drawn without one",
+                s.frames,
+                (now - since).as_secs_f64(),
+                s.vblanks,
+                s.wait_sum.as_secs_f64() * 1e3 / s.vblanks.max(1) as f64,
+                s.wait_max.as_secs_f64() * 1e3,
+                s.vblank_timeouts
             );
-            self.renderer.record_scene(gpu, cmd, scene.view, sc.extent, self.clear, &quads);
-            image_barrier(
-                gpu,
-                cmd,
-                scene.image,
-                to_attachment,
-                (
-                    vk::PipelineStageFlags2::FRAGMENT_SHADER,
-                    vk::AccessFlags2::SHADER_SAMPLED_READ,
-                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                ),
-                None,
-            );
-            let p = (self.pointer.0 as f64, self.pointer.1 as f64);
-            self.renderer
-                .record_zoom(gpu, cmd, view, sc.extent, scene, self.zoom.current(), self.zoom.origin(p));
-        } else {
-            self.renderer.record_scene(gpu, cmd, view, sc.extent, self.clear, &quads);
         }
-        image_barrier(
-            gpu,
-            cmd,
-            image,
-            to_attachment,
-            (vk::PipelineStageFlags2::NONE, vk::AccessFlags2::NONE, vk::ImageLayout::PRESENT_SRC_KHR),
-            None,
-        );
-        for t in &external {
-            gpu.record_release(cmd, t);
-        }
-        unsafe { dev.end_command_buffer(cmd)? };
-
-        let rendered = sc.rendered[index as usize];
-        let waits = [vk::SemaphoreSubmitInfo::default()
-            .semaphore(acquired)
-            .stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)];
-        let signals = [vk::SemaphoreSubmitInfo::default()
-            .semaphore(rendered)
-            .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
-        let cmds = [vk::CommandBufferSubmitInfo::default().command_buffer(cmd)];
-        let submit = [vk::SubmitInfo2::default()
-            .wait_semaphore_infos(&waits)
-            .command_buffer_infos(&cmds)
-            .signal_semaphore_infos(&signals)];
-        unsafe { dev.queue_submit2(gpu.queue, &submit, fence)? };
-        self.frames[slot].number = self.frame_no;
-        let submitted_ms = now.elapsed().as_secs_f64() * 1e3;
-        let frame_no = self.frame_no;
-        let nquads = quads.len();
-        self.frame_no += 1;
-
-        let swapchains = [sc.swapchain];
-        let indices = [index];
-        let wait = [rendered];
-        let present = vk::PresentInfoKHR::default()
-            .wait_semaphores(&wait)
-            .swapchains(&swapchains)
-            .image_indices(&indices);
-        let t_present = Instant::now();
-        let presented = unsafe { swfn.queue_present(gpu.queue, &present) };
-        log::trace!(
-            "frame {frame_no} zoom {:.4} pointer {:?} quads {nquads}: acquire {acquire_ms:.1} ms, \
-             submitted at {submitted_ms:.1} ms, present {:.1} ms",
-            self.zoom.current(),
-            self.pointer,
-            t_present.elapsed().as_secs_f64() * 1e3
-        );
-        match presented {
-            Ok(false) => {}
-            Ok(true) | Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => self.recreate_swapchain()?,
-            Err(e) => return Err(e).context("vkQueuePresentKHR"),
-        }
-        Ok(())
-    }
-
-    fn mark_all_dirty(&mut self) {
-        for w in self.wins.iter_mut() {
-            w.content_dirty = true;
-        }
-        if let Some(bg) = self.background.as_mut() {
-            bg.dirty = bg.source == Source::Shm;
-        }
+        self.stats.since = Some(now);
     }
 
     /// Runs until a signal arrives on `sigfd` or another compositor takes over.
     pub fn run(&mut self, sigfd: RawFd) -> Result<()> {
         let xfd = self.x.conn.as_raw_fd();
         loop {
-            // Checked every iteration: under continuous rendering the loop may
-            // not reach poll() for a long time.
+            watchdog::busy();
             if let Some(signo) = pending_signal(sigfd) {
                 log::info!("signal {signo}, shutting down");
                 return Ok(());
@@ -794,98 +566,95 @@ impl Compositor {
             }
             let now = Instant::now();
             let mut timeout: Option<Duration> = None;
+            let mut wake = |d: Duration| timeout = Some(timeout.map_or(d, |t| t.min(d)));
+            self.zoom.advance(now);
             if self.zoom.active() {
-                if let Some(p) = self.x.pointer()
-                    && p != self.pointer {
+                if now >= self.next_pointer_poll {
+                    if let Some(p) = self.x.pointer() {
                         self.pointer = p;
-                        self.dirty = true;
                     }
-                timeout = Some(POINTER_POLL);
-            }
-            if self.zoom.animating() {
-                self.dirty = true;
-            }
-            if self.dirty {
-                let wait = self.last_frame.map_or(Duration::ZERO, |t| self.min_interval.saturating_sub(now - t));
-                if wait.is_zero() {
-                    self.dirty = false;
-                    self.last_frame = Some(now);
-                    self.render()?;
-                    continue;
+                    self.next_pointer_poll = now + POINTER_POLL;
                 }
-                timeout = Some(timeout.map_or(wait, |t| t.min(wait)));
+                wake(self.next_pointer_poll - now);
             }
+            if let Some(d) = self.update_redirection(now)? {
+                wake(d);
+            }
+            if self.unredirected.is_none() && self.wants_frame() {
+                // Draw right after a vblank. Without the Present extension, or
+                // while no vblank comes (monitor off, VT away), a timer paces.
+                let rested = self.last_frame.map_or(Duration::MAX, |t| now - t);
+                // Present completes at once when the driver cannot wait for a
+                // vblank (no CRTC), so its frames are capped too, with slack.
+                let floor = if self.x.present { self.min_interval * 3 / 4 } else { self.min_interval };
+                if rested < floor {
+                    wake(floor - rested);
+                } else if !self.x.present || self.vblank_due {
+                    self.frame(now)?;
+                    continue;
+                } else if let Some((_, asked)) = self.pending_msc {
+                    let waited = (now - asked).min(rested);
+                    if waited >= VBLANK_TIMEOUT {
+                        self.stats.vblank_timeouts += 1;
+                        log::trace!("no vblank for {} ms; drawing anyway", VBLANK_TIMEOUT.as_millis());
+                        self.frame(now)?;
+                        continue;
+                    }
+                    wake(VBLANK_TIMEOUT - waited);
+                } else {
+                    self.serial = self.serial.wrapping_add(1);
+                    self.x.notify_next_vblank(self.serial)?;
+                    self.pending_msc = Some((self.serial, now));
+                    wake(VBLANK_TIMEOUT);
+                }
+            } else {
+                // A vblank nobody waited for must not hurry a later frame.
+                self.vblank_due = false;
+            }
+            self.log_stats(now);
             self.x.conn.flush()?;
-            let mut fds = [
+            watchdog::idle();
+
+            let mut fds = vec![
                 libc::pollfd { fd: xfd, events: libc::POLLIN, revents: 0 },
                 libc::pollfd { fd: sigfd, events: libc::POLLIN, revents: 0 },
             ];
-            let ms = timeout.map_or(-1, |t| t.as_micros().div_ceil(1000) as i32);
-            let n = unsafe { libc::poll(fds.as_mut_ptr(), 2, ms) };
+            if let Some(vt) = &self.vt {
+                fds.push(libc::pollfd { fd: vt.fd(), events: libc::POLLPRI | libc::POLLERR, revents: 0 });
+            }
+            let ms = timeout.map_or(-1, |t| t.as_micros().div_ceil(1000).min(i32::MAX as u128) as i32);
+            let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, ms) };
             if n < 0 {
                 let e = std::io::Error::last_os_error();
                 if e.kind() != std::io::ErrorKind::Interrupted {
                     return Err(e).context("poll");
                 }
             }
-        }
-    }
-
-    fn teardown_gpu(&mut self) {
-        let gpu = &*self.gpu;
-        unsafe {
-            let _ = gpu.device.device_wait_idle();
-        }
-        for mut w in self.wins.drain() {
-            if let Some(t) = w.tex.take() {
-                t.destroy(gpu);
+            if fds.get(2).is_some_and(|f| f.revents != 0) && self.vt.as_mut().is_some_and(|vt| vt.returned()) {
+                watchdog::busy();
+                log::info!("back on the X server's VT; repainting everything");
+                self.repaint_all()?;
             }
-            if let Some(p) = w.pixmap.take() {
-                let _ = self.x.conn.free_pixmap(p).map(|c| c.ignore_error());
-            }
-            if let Some(d) = w.damage.take() {
-                let _ = self.x.conn.damage_destroy(d).map(|c| c.ignore_error());
-            }
-        }
-        if let Some(bg) = self.background.take() {
-            bg.tex.destroy(gpu);
-        }
-        for (_, g) in self.garbage.drain(..) {
-            match g {
-                Garbage::Texture(t) => t.destroy(gpu),
-                Garbage::Buffer(b) => b.destroy(gpu),
-            }
-        }
-        for f in self.frames.drain(..) {
-            unsafe {
-                gpu.device.destroy_fence(f.fence, None);
-                gpu.device.destroy_semaphore(f.acquired, None);
-                gpu.device.free_command_buffers(gpu.cmd_pool, &[f.cmd]);
-            }
-            if let Some(b) = f.staging {
-                b.destroy(gpu);
-            }
-        }
-        if let Some(s) = self.scene.take() {
-            s.destroy(gpu);
-        }
-        if let Some(sc) = self.swapchain.take() {
-            sc.destroy(gpu);
-        }
-        self.renderer.destroy(gpu);
-        // Drops the device and the surface, which must go before the overlay window.
-        unsafe { ManuallyDrop::drop(&mut self.gpu) };
-        self.reader.release(&self.x.conn);
-        if let Some(f) = self.fence.take() {
-            use x11rb::protocol::sync::ConnectionExt as _;
-            let _ = self.x.conn.sync_destroy_fence(f).map(|c| c.ignore_error());
         }
     }
 }
 
 impl Drop for Compositor {
     fn drop(&mut self) {
-        self.teardown_gpu();
+        for w in self.wins.drain() {
+            if let Some(p) = w.picture {
+                let _ = self.x.conn.render_free_picture(p);
+            }
+            if let Some(p) = w.pixmap {
+                let _ = self.x.conn.free_pixmap(p);
+            }
+            if let Some(d) = w.damage {
+                let _ = self.x.conn.damage_destroy(d);
+            }
+        }
+        self.background.release(&self.x);
+        self.scene.destroy(&self.x);
+        let _ = self.x.conn.render_free_picture(self.overlay_picture);
         self.x.release_compositor();
         log::info!("released the screen");
     }

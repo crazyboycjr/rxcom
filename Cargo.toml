@@ -1,17 +1,16 @@
 [package]
 name = "rxcom"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
-description = "An X11 compositor on Vulkan"
+description = "An X11 compositor with a desktop zoom"
 license = "MIT"
 
 [dependencies]
 anyhow = "1"
-ash = "0.38"
 libc = "0.2"
 log = "0.4"
-x11rb = { version = "0.14", features = ["allow-unsafe-code", "composite", "damage", "dri3", "present", "randr", "shape", "shm", "sync", "xfixes"] }
+x11rb = { version = "0.14", features = ["allow-unsafe-code", "composite", "damage", "dri3", "present", "randr", "render", "shape", "sync", "xfixes"] }
 
 [profile.release]
 debug = 1

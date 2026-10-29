@@ -663,7 +663,12 @@ rxcom checks its Vulkan fence without blocking before it composes.
 
 - Whether NVIDIA's X driver accepts PixmapFromBuffers and renders into such a
   pixmap at full speed; otherwise the BuffersFromPixmap route, otherwise the X
-  presenter. rxcom logs the route it took.
+  presenter. rxcom logs the route it took, and the time each composition into
+  the shared scene takes until its fence reads triggered, so "full speed" gets
+  a number.
+- On the BuffersFromPixmap route, whether the exported scene's buffer stays
+  allocated inside Xorg after rxcom exits, as the 10-22 exports did: Xorg's
+  memory in `nvidia-smi` before and after two or three restarts of rxcom.
 - Whether QueryFence keeps reading triggered where SyncAwaitFence lost its
   wakeup, and how long the polled waits are at 240 Hz.
 - Flips, pacing at 240 Hz, VT round trips, the monitor going away, and games

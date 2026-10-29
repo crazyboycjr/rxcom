@@ -1,9 +1,8 @@
 //! The top-level windows (children of the root) in stacking order, with the X
-//! and GPU resources the compositor holds for each.
+//! resources the compositor holds for each.
 
-use crate::gpu::texture::Texture;
 use std::collections::HashMap;
-use x11rb::protocol::xproto::Window;
+use x11rb::protocol::xproto::{Rectangle, Window};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Geometry {
@@ -15,58 +14,49 @@ pub struct Geometry {
 }
 
 impl Geometry {
-    /// The size of the window pixmap, which includes the border.
-    pub fn outer_size(&self) -> (u32, u32) {
-        let b = 2 * self.border as u32;
-        (self.width as u32 + b, self.height as u32 + b)
+    /// The window's area on the screen, border included, which is also the size
+    /// of its pixmap.
+    pub fn outer(&self) -> Rectangle {
+        let b = 2 * self.border;
+        Rectangle { x: self.x, y: self.y, width: self.width + b, height: self.height + b }
     }
-}
-
-/// How the window's pixels reach the GPU.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Source {
-    /// The pixmap's dma-buf is imported; the GPU samples it in place.
-    DmaBuf,
-    /// Pixels are copied with MIT-SHM GetImage and uploaded after each damage.
-    Shm,
 }
 
 #[derive(Debug)]
 pub struct Win {
     pub id: Window,
     pub geom: Geometry,
-    pub depth: u8,
+    pub visual: u32,
     pub input_only: bool,
-    pub override_redirect: bool,
     pub mapped: bool,
     /// The overlay window and our own windows: tracked for stacking, never drawn.
     pub ignored: bool,
+    /// The bounding region is not the plain rectangle.
+    pub shaped: bool,
     pub damage: Option<u32>,
     pub pixmap: Option<u32>,
-    /// The named pixmap no longer matches the window (just mapped or resized).
-    pub pixmap_stale: bool,
-    /// Damaged since the last frame.
-    pub content_dirty: bool,
-    pub source: Option<Source>,
-    pub tex: Option<Texture>,
+    pub picture: Option<u32>,
+    /// The picture has alpha, so the window blends instead of covering.
+    pub alpha: bool,
+    /// The picture no longer matches the window (just mapped, resized or reshaped).
+    pub stale: bool,
 }
 
 impl Win {
-    pub fn new(id: Window, geom: Geometry, depth: u8) -> Self {
+    pub fn new(id: Window, geom: Geometry, visual: u32) -> Self {
         Win {
             id,
             geom,
-            depth,
+            visual,
             input_only: false,
-            override_redirect: false,
             mapped: false,
             ignored: false,
+            shaped: false,
             damage: None,
             pixmap: None,
-            pixmap_stale: false,
-            content_dirty: false,
-            source: None,
-            tex: None,
+            picture: None,
+            alpha: false,
+            stale: false,
         }
     }
 
@@ -185,7 +175,7 @@ mod tests {
     fn list(ids: &[Window]) -> WinList {
         let mut l = WinList::new();
         for &id in ids {
-            l.insert_top(Win::new(id, Geometry::default(), 24));
+            l.insert_top(Win::new(id, Geometry::default(), 0));
         }
         l
     }
@@ -212,7 +202,7 @@ mod tests {
         assert_eq!(l.order(), &[3, 2, 1]);
         assert!(l.remove(2).is_some());
         assert_eq!(l.order(), &[3, 1]);
-        l.insert_top(Win::new(3, Geometry::default(), 24));
+        l.insert_top(Win::new(3, Geometry::default(), 0));
         assert_eq!(l.order(), &[1, 3]);
     }
 }
