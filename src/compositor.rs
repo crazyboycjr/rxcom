@@ -175,7 +175,7 @@ fn try_gpu(x: &X, display: Option<&str>, mode: Option<ash::vk::PresentModeKHR>) 
         log::info!("no DRI3 1.2: the X server presents");
         return (None, None);
     }
-    match Gpu::new(x, display, mode) {
+    match watchdog::setting_up(|| Gpu::new(x, display, mode)) {
         Ok((gpu, pixmap)) => {
             log::info!("presenting with {}", gpu.route);
             (Some(gpu), Some(pixmap))
@@ -190,7 +190,7 @@ fn try_gpu(x: &X, display: Option<&str>, mode: Option<ash::vk::PresentModeKHR>) 
 /// The GL presenter showing `scene`, or None when GL cannot present here and
 /// the X server will.
 fn try_gl(x: &X, display: Option<&str>, scene: u32) -> Option<Gl> {
-    match Gl::new(x, display, scene) {
+    match watchdog::setting_up(|| Gl::new(x, display, scene)) {
         Ok(gl) => {
             log::info!("presenting with {}", gl.route);
             Some(gl)

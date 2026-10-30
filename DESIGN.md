@@ -708,6 +708,8 @@ after 50 ms.
   when rxcom's connection closes, so the desktop is usable meanwhile, and the
   watchdog starts a new rxcom, which backs off (1 s, then 2, 4, ... up to 32) and
   takes over once the stuck one is gone; after five restarts in a row it stops.
+  A turn stuck while GL or Vulkan was being set up restarts it with the X
+  presenter.
 - **Signals.** SIGINT and SIGTERM restore the screen as the prototype does.
   SIGHUP is ignored, so `rxcom &` outlives the terminal it was started from.
 - **Unredirection,** picom's rule with its 200 ms delay: when the top-most mapped
@@ -795,7 +797,7 @@ first trial answers these.
 | `src/gpu.rs` | 870 | the Vulkan presenter: the shared scene, the pass, the swapchain and what its images hold |
 | `src/gl.rs` | 798 | the GL presenter: GLX, the bound scene, the imported X fences, buffer age (section 9) |
 | `src/zoom.rs` | 115 | picom-zoom's easing and view |
-| `src/watchdog.rs`, `vt.rs`, `logger.rs`, `lib.rs` | 195 | restarts, the VT watch, logging |
+| `src/watchdog.rs`, `vt.rs`, `logger.rs`, `lib.rs` | 210 | restarts, the VT watch, logging |
 | `shaders/` | 28 | the Vulkan pass; GL's is in `gl.rs` |
 
 That is about 4,070 lines of Rust without its unit tests, against xcompmgr's

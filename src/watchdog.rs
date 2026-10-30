@@ -1,18 +1,20 @@
 //! Restarts rxcom when one turn of its loop takes far too long: a spin, or a
 //! call into a driver that never returns. The stuck process aborts, and the X
 //! server undoes its redirection when the connection closes, so the desktop is
-//! usable meanwhile; a new rxcom takes over after a backoff.
+//! usable meanwhile; a new rxcom takes over after a backoff, with the X
+//! presenter if GL or Vulkan was being set up.
 //!
 //! Waiting for the X server does not count. A stalled or grabbed server freezes
 //! the desktop whatever rxcom does, and rxcom carries on once it answers.
 
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// When the current turn started, in ms since START plus one; 0 while idle.
 static BUSY_SINCE: AtomicU64 = AtomicU64::new(0);
 static START: OnceLock<Instant> = OnceLock::new();
+static SETTING_UP: AtomicBool = AtomicBool::new(false);
 /// After this many restarts in a row rxcom gives up.
 const MAX_RESTARTS: u32 = 5;
 
@@ -43,8 +45,13 @@ fn restart() {
         log::error!("restarted {MAX_RESTARTS} times already; giving up");
         return;
     }
+    let mut args: Vec<_> = std::env::args_os().skip(1).collect();
+    if SETTING_UP.load(Ordering::Relaxed) {
+        log::error!("stuck setting the presenter up; the X server presents from now on");
+        args.extend(["--present".into(), "x".into()]);
+    }
     let child = std::process::Command::new("/proc/self/exe")
-        .args(std::env::args_os().skip(1))
+        .args(args)
         .env("RXCOM_RESTARTS", n.to_string())
         .spawn();
     match child {
@@ -91,4 +98,12 @@ pub fn busy() {
 
 pub fn idle() {
     BUSY_SINCE.store(0, Ordering::Relaxed);
+}
+
+/// Marks the GL or Vulkan presenter's set-up, for the duration of `f`.
+pub fn setting_up<T>(f: impl FnOnce() -> T) -> T {
+    SETTING_UP.store(true, Ordering::Relaxed);
+    let t = f();
+    SETTING_UP.store(false, Ordering::Relaxed);
+    t
 }
