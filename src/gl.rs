@@ -4,8 +4,10 @@
 //! swap interval 1 the driver flips at vblank. A frame waits for the X server's
 //! composition on the GPU, through X fences imported once with
 //! GL_EXT_x11_sync_object, and redraws only what changed since its back buffer
-//! was last shown (GLX_EXT_buffer_age). Nothing here waits on the CPU: a frame
-//! starts only once the GPU is done with what it needs.
+//! was last shown (GLX_EXT_buffer_age). A frame starts only once the GPU is
+//! done with what it needs. The one wait on the CPU is inside NVIDIA's
+//! glWaitSync, which returns only once the X server has triggered the fence, so
+//! the trigger always goes first.
 
 use crate::scene::union;
 use crate::x::{Marker, X};
@@ -273,9 +275,11 @@ pub struct Gl {
     reads: Option<glow::Fence>,
     /// The damage of the frames shown last, newest first; None: everything.
     history: VecDeque<Option<Rectangle>>,
-    /// Since the last `take_stats`: partial redraws and the slowest swap call.
+    /// Since the last `take_stats`: partial redraws, the slowest swap call and
+    /// the slowest wait for an X fence.
     partial: u32,
     slowest_swap: Duration,
+    slowest_wait: Duration,
     stuck_logged: bool,
     pub route: String,
     // Dropped last: the context and the connection.
@@ -361,6 +365,7 @@ impl Gl {
             history: VecDeque::new(),
             partial: 0,
             slowest_swap: Duration::ZERO,
+            slowest_wait: Duration::ZERO,
             stuck_logged: false,
             route: String::new(),
             base,
@@ -369,10 +374,7 @@ impl Gl {
         me.rebind = !me.bind_scene(x, pixmap_config, scene)?;
         if me.gl.supported_extensions().contains("GL_EXT_x11_sync_object") {
             me.import_fences(x)?;
-            if !me.fences_work(x)? {
-                log::info!("an X fence's GPU wait does not hold until its trigger; polling instead");
-                me.release(x);
-            }
+            me.check_fences(x)?;
         }
         let sync = me.waits_on_gpu();
         me.base.x_errors("setting GL up")?;
@@ -473,38 +475,28 @@ impl Gl {
         Ok(())
     }
 
-    /// Whether an imported fence works as frames use it, which the extension
-    /// leaves open: a GPU wait on it holds until the X server triggers it, and
-    /// does so again after a reset. Where a wait never ends, GL is refused.
-    fn fences_work(&self, x: &X) -> Result<bool> {
+    /// Checks that an imported fence works as frames use it, which the
+    /// extension leaves open after a reset: a GPU wait issued after a trigger
+    /// ends, and again after a reset. Where it does not, GL is refused.
+    fn check_fences(&self, x: &X) -> Result<()> {
         let (gl, f) = (&self.gl, &self.fences[0]);
-        for round in 0..2 {
-            if round > 0 {
-                x.conn.sync_reset_fence(f.id)?;
-                x.reached(x.marker()?)?;
-            }
-            let done = unsafe {
-                gl.wait_sync(f.sync, 0, u64::MAX);
-                let done = gl.fence_sync(glow::SYNC_GPU_COMMANDS_COMPLETE, 0).map_err(|e| anyhow!(e))?;
-                gl.flush();
-                done
-            };
-            let wait = |ns| unsafe { gl.client_wait_sync(done, glow::SYNC_FLUSH_COMMANDS_BIT, ns) };
-            let held = wait(20_000_000) == glow::TIMEOUT_EXPIRED;
+        for _ in 0..2 {
             x.conn.sync_trigger_fence(f.id)?;
             x.conn.flush()?;
-            let released = matches!(wait(1_000_000_000), glow::ALREADY_SIGNALED | glow::CONDITION_SATISFIED);
-            unsafe { gl.delete_sync(done) };
+            let released = unsafe {
+                gl.wait_sync(f.sync, 0, u64::MAX);
+                let done = gl.fence_sync(glow::SYNC_GPU_COMMANDS_COMPLETE, 0).map_err(|e| anyhow!(e))?;
+                let r = gl.client_wait_sync(done, glow::SYNC_FLUSH_COMMANDS_BIT, 1_000_000_000);
+                gl.delete_sync(done);
+                matches!(r, glow::ALREADY_SIGNALED | glow::CONDITION_SATISFIED)
+            };
             if !released {
                 bail!("a GPU wait for an X fence did not end after its trigger");
             }
-            if !held {
-                return Ok(false);
-            }
+            x.conn.sync_reset_fence(f.id)?;
+            x.reached(x.marker()?)?;
         }
-        x.conn.sync_reset_fence(f.id)?;
-        x.reached(x.marker()?)?;
-        Ok(true)
+        Ok(())
     }
 
     /// Whether the GPU has run a fence.
@@ -590,7 +582,9 @@ impl Gl {
             let f = &mut self.fences[i];
             x.conn.sync_trigger_fence(f.id)?;
             x.conn.flush()?;
+            let start = Instant::now();
             unsafe { self.gl.wait_sync(f.sync, 0, u64::MAX) };
+            self.slowest_wait = self.slowest_wait.max(start.elapsed());
             f.state = FenceState::Triggered(Instant::now());
         }
         if self.rebind && damage.is_some() {
@@ -663,9 +657,11 @@ impl Gl {
         lacking(&self.history, age, damage)
     }
 
-    /// Partial redraws and the slowest swap call since the last call.
-    pub fn take_stats(&mut self) -> (u32, Duration) {
-        (std::mem::take(&mut self.partial), std::mem::take(&mut self.slowest_swap))
+    /// Partial redraws, the slowest swap call and the slowest fence wait since
+    /// the last call.
+    pub fn take_stats(&mut self) -> (u32, Duration, Duration) {
+        use std::mem::take;
+        (take(&mut self.partial), take(&mut self.slowest_swap), take(&mut self.slowest_wait))
     }
 
     /// Destroys the X fences, which belong to rxcom's own connection.

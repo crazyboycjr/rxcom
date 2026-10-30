@@ -925,8 +925,13 @@ impl Compositor {
             return;
         }
         let s = std::mem::take(&mut self.stats);
-        let gl = self.gl.as_mut().map(Gl::take_stats).map_or(String::new(), |(partial, swap)| {
-            format!("; {partial} partial redraws, the slowest swap call took {:.2} ms", swap.as_secs_f64() * 1e3)
+        let gl = self.gl.as_mut().map(Gl::take_stats).map_or(String::new(), |(partial, swap, wait)| {
+            let ms = |d: Duration| d.as_secs_f64() * 1e3;
+            format!(
+                "; {partial} partial redraws, the slowest swap call took {:.2} ms, the slowest fence wait {:.2} ms",
+                ms(swap),
+                ms(wait)
+            )
         });
         log::debug!(
             "{} frames in {:.0} s, {} composed, {} drawn, {} waited for a free image; X's GPU work took {:.2} ms \

@@ -793,7 +793,7 @@ first trial answers these.
 | `src/scene.rs` | 238 | the XRender composition, its damage, stand-ins, the X presenter, the background |
 | `src/compositor.rs` | 1044 | events, damage, waiting for clients, frames and their pacing, unredirection, VT, recovery, the loop |
 | `src/gpu.rs` | 870 | the Vulkan presenter: the shared scene, the pass, the swapchain and what its images hold |
-| `src/gl.rs` | 759 | the GL presenter: GLX, the bound scene, the imported X fences, buffer age (section 9) |
+| `src/gl.rs` | 798 | the GL presenter: GLX, the bound scene, the imported X fences, buffer age (section 9) |
 | `src/zoom.rs` | 115 | picom-zoom's easing and view |
 | `src/watchdog.rs`, `vt.rs`, `logger.rs`, `lib.rs` | 195 | restarts, the VT watch, logging |
 | `shaders/` | 28 | the Vulkan pass; GL's is in `gl.rs` |
@@ -861,10 +861,12 @@ backend did that hurt here, rxcom does not do.
   resets it, and a round trip begun with the reset is collected before the fence
   is used again, since a GPU wait issued before the X server processed the reset
   could see the old trigger. The extension leaves resets undefined, so rxcom
-  tests at start that a wait holds until the trigger and does so again after a
-  reset; where it does not hold, rxcom polls with QueryFence as for Vulkan, and
-  where a wait never ends, GL is refused. A fence not triggered after 100 ms is
-  triggered again. Mesa has no such fences and polls.
+  tests at start that a wait issued after a trigger ends, and again after a
+  reset; where one does not, GL is refused. The trigger always goes first:
+  NVIDIA's glWaitSync returns only once the X server has triggered the fence,
+  polling on the CPU until then, so the first version's test, which issued its
+  wait before the trigger, hung every start (10-29, 23:21). A fence not
+  triggered after 100 ms is triggered again. Mesa has no such fences and polls.
 - **Only what changed**: swap interval 1 on the overlay window, a frame only
   when the scene or the view changed, and GLX_EXT_buffer_age to redraw only what
   the back buffer lacks: the new damage and that of the frames shown since that
@@ -875,13 +877,16 @@ backend did that hurt here, rxcom does not do.
   without waiting; X composes into the scene only once a fence after the last
   draw says GL has read it; and no frame is drawn while no vblanks arrive (no lit
   monitor, the screen saver on, another VT in front), since the swap would wait
-  for one. The slowest swap call of each ten seconds is logged.
+  for one. The slowest swap call and the slowest glWaitSync of each ten seconds
+  are logged.
 - **Set up only while vblanks arrive**: NVIDIA's glXCreatePixmap,
   glXBindTexImageEXT and glXDestroyPixmap wait for a vblank whenever some client
   has a vsync'd present pending (`infra/xorg-resize-stall.md`), and with the OLED
   off and disconnected none comes. On 10-29 at 17:29 a GL rxcom started that way
   hung in its first bind, its only thread polling in nanosleep, after it had
-  taken the screen and before the watchdog started. So GL is set up, and moved
+  taken the screen and before the watchdog started. The fence test's hang at
+  23:21, with the monitor lit, looked the same, so 17:29 may have been that one
+  instead. So GL is set up, and moved
   to a new scene after a RandR change, only while vblanks arrive; the X presenter
   shows the desktop until then. Without vblanks, ending GL leaves its binding to
   the process's exit rather than unbind it. The sharing test needs no rebind
