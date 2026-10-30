@@ -112,16 +112,23 @@ fn signal_fd() -> Result<RawFd> {
 }
 
 /// Starts compositing. After a restart by the watchdog, backs off first and
-/// waits for the stuck instance to let go of the screen.
+/// waits for the stuck instance to let go of the screen. The watchdog already
+/// watches each attempt, since a driver can hang while setting up.
 fn start(opts: &Options) -> Result<Compositor> {
+    let attempt = || {
+        rxcom::watchdog::busy();
+        let c = Compositor::new(opts);
+        rxcom::watchdog::idle();
+        c
+    };
     let restarts = rxcom::watchdog::restarts();
     if restarts == 0 {
-        return Compositor::new(opts);
+        return attempt();
     }
     std::thread::sleep(Duration::from_secs(1 << (restarts - 1).min(5)));
     let since = Instant::now();
     loop {
-        match Compositor::new(opts) {
+        match attempt() {
             Err(e) if e.to_string().contains("another compositor") && since.elapsed() < Duration::from_secs(30) => {
                 std::thread::sleep(Duration::from_millis(500))
             }
@@ -140,8 +147,8 @@ fn main() -> ExitCode {
     };
     rxcom::logger::init(verbose);
     let result = signal_fd().and_then(|sigfd| {
-        let mut c = start(&opts)?;
         rxcom::watchdog::start(WATCHDOG);
+        let mut c = start(&opts)?;
         c.run(sigfd)
     });
     match result {
