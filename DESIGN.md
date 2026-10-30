@@ -910,7 +910,13 @@ backend did that hurt here, rxcom does not do.
   Mesa's zink on NVIDIA's Vulkan binds the pixmap but samples black: the start
   test refuses it, and the X server presents.
 - The buffer age's arithmetic has unit tests.
-- Only the real display shows whether NVIDIA's binding shares the scene, whether
-  its imported fences hold and release, the partial redraws, whether a swap ever
-  blocks, the flips, the VRR indicator reading normal, a VT round trip, and the
-  power the trial compares.
+- On the real display (the user's trial, 10-29 23:44, FFCP off, with an app
+  redrawing about 230 times a second throughout): NVIDIA's binding shares the
+  scene, so it is never rebound; the fences release, the slowest glWaitSync of
+  each ten seconds taking 0.33 to 0.6 ms (2.1 ms once, just after start); almost
+  every frame is a partial redraw; the slowest swap call takes 0.16 to 0.49 ms;
+  the VRR indicator reads normal and nothing tears. Under the same load the X
+  presenter with FFCP drew 72 W with the GPU at P0, GL 42 W at P3 (graphics at
+  1.3 GHz, memory at 5 GHz); rxcom used 2.2 to 2.5% of a core instead of 0.5%,
+  Xorg 0.8% either way. GL has been the user's presenter since. Not yet seen: a
+  quiet desktop's power and a VT round trip.
