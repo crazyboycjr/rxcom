@@ -5,9 +5,10 @@
 //! composition on the GPU, through X fences imported once with
 //! GL_EXT_x11_sync_object, and redraws only what changed since its back buffer
 //! was last shown (GLX_EXT_buffer_age). A frame starts only once the GPU is
-//! done with what it needs. The one wait on the CPU is inside NVIDIA's
-//! glWaitSync, which returns only once the X server has triggered the fence, so
-//! the trigger always goes first.
+//! done with what it needs. The one wait on the CPU is for the X server to
+//! trigger the composition's fence, polled here rather than left to NVIDIA's
+//! glWaitSync, which holds inside the driver until the trigger: at a VT switch
+//! none comes, and the X server's switch then waits for the stuck client.
 
 use crate::scene::union;
 use crate::x::{Marker, X};
@@ -47,6 +48,8 @@ const FENCES: usize = 4;
 /// A composition fence not triggered after this long is triggered again, in
 /// case the X server lost the first trigger.
 const FENCE_STUCK: Duration = Duration::from_millis(100);
+/// How long a frame waits for its composition's fence before it gives up.
+const COMPOSITION_WAIT: Duration = Duration::from_millis(50);
 /// Frames whose damage is kept for the buffer age.
 const HISTORY: usize = 4;
 
@@ -281,6 +284,8 @@ pub struct Gl {
     slowest_swap: Duration,
     slowest_wait: Duration,
     stuck_logged: bool,
+    /// A frame gave up waiting for its composition: the next redraws all.
+    missed: bool,
     pub route: String,
     // Dropped last: the context and the connection.
     base: Base,
@@ -367,6 +372,7 @@ impl Gl {
             slowest_swap: Duration::ZERO,
             slowest_wait: Duration::ZERO,
             stuck_logged: false,
+            missed: false,
             route: String::new(),
             base,
         };
@@ -483,6 +489,9 @@ impl Gl {
         for _ in 0..2 {
             x.conn.sync_trigger_fence(f.id)?;
             x.conn.flush()?;
+            if !self.triggered_within(f.sync, Duration::from_secs(1)) {
+                bail!("an X fence did not read as triggered after its trigger");
+            }
             let released = unsafe {
                 gl.wait_sync(f.sync, 0, u64::MAX);
                 let done = gl.fence_sync(glow::SYNC_GPU_COMMANDS_COMPLETE, 0).map_err(|e| anyhow!(e))?;
@@ -502,6 +511,18 @@ impl Gl {
     /// Whether the GPU has run a fence.
     fn signalled(&self, f: glow::Fence) -> bool {
         unsafe { self.gl.get_sync_status(f) == glow::SIGNALED }
+    }
+
+    /// Whether the X server triggers an imported fence within `limit`.
+    fn triggered_within(&self, f: glow::Fence, limit: Duration) -> bool {
+        let start = Instant::now();
+        while !self.signalled(f) {
+            if start.elapsed() >= limit {
+                return false;
+            }
+            std::thread::sleep(Duration::from_micros(100));
+        }
+        true
     }
 
     /// Whether a frame can start without anything waiting on the CPU: few
@@ -568,6 +589,12 @@ impl Gl {
         !self.fences.is_empty()
     }
 
+    /// Whether a frame gave up waiting for its composition and still needs
+    /// drawing.
+    pub fn missed(&self) -> bool {
+        self.missed
+    }
+
     /// After a VT switch the back buffers' contents are unknown.
     pub fn forget_history(&mut self) {
         self.history.clear();
@@ -579,14 +606,20 @@ impl Gl {
     /// not presented. Returns whether it presented.
     pub fn draw(&mut self, x: &X, view: View, linear: bool, damage: Option<Rectangle>, full: bool) -> Result<bool> {
         if let Some(i) = self.reserved.take() {
-            let f = &mut self.fences[i];
-            x.conn.sync_trigger_fence(f.id)?;
+            let (id, sync) = (self.fences[i].id, self.fences[i].sync);
+            x.conn.sync_trigger_fence(id)?;
             x.conn.flush()?;
             let start = Instant::now();
-            unsafe { self.gl.wait_sync(f.sync, 0, u64::MAX) };
+            self.fences[i].state = FenceState::Triggered(start);
+            if !self.triggered_within(sync, COMPOSITION_WAIT) {
+                log::info!("no trigger for a composition's fence within 50 ms; the next frame redraws all");
+                self.missed = true;
+                return Ok(false);
+            }
+            unsafe { self.gl.wait_sync(sync, 0, u64::MAX) };
             self.slowest_wait = self.slowest_wait.max(start.elapsed());
-            f.state = FenceState::Triggered(Instant::now());
         }
+        let full = full || std::mem::take(&mut self.missed);
         if self.rebind && damage.is_some() {
             self.rebind();
         }

@@ -867,8 +867,16 @@ backend did that hurt here, rxcom does not do.
   reset; where one does not, GL is refused. The trigger always goes first:
   NVIDIA's glWaitSync returns only once the X server has triggered the fence,
   polling on the CPU until then, so the first version's test, which issued its
-  wait before the trigger, hung every start (10-29, 23:21). A fence not
-  triggered after 100 ms is triggered again. Mesa has no such fences and polls.
+  wait before the trigger, hung every start (10-29, 23:21). Frames left the
+  wait to glWaitSync too, until the first VT switch with GL (10-30, 00:00): no
+  trigger came, NVIDIA's X server held its switch until the stuck rxcom was
+  killed by the watchdog, five seconds later, and came back without most of its
+  keyboard and mouse devices, whose logind pauses it had taken too late. So
+  rxcom now polls the fence's status (glGetSynciv) itself, outside the driver,
+  and calls glWaitSync only once the fence reads triggered; a frame whose
+  trigger has not come within 50 ms gives up, and the next redraws everything.
+  A fence not triggered after 100 ms is triggered again. Mesa has no such
+  fences and polls.
 - **Only what changed**: swap interval 1 on the overlay window, a frame only
   when the scene or the view changed, and GLX_EXT_buffer_age to redraw only what
   the back buffer lacks: the new damage and that of the frames shown since that
@@ -879,8 +887,8 @@ backend did that hurt here, rxcom does not do.
   without waiting; X composes into the scene only once a fence after the last
   draw says GL has read it; and no frame is drawn while no vblanks arrive (no lit
   monitor, the screen saver on, another VT in front), since the swap would wait
-  for one. The slowest swap call and the slowest glWaitSync of each ten seconds
-  are logged.
+  for one. The slowest swap call and the slowest wait for a composition's fence
+  of each ten seconds are logged.
 - **Set up only while vblanks arrive**: NVIDIA's glXCreatePixmap,
   glXBindTexImageEXT and glXDestroyPixmap wait for a vblank whenever some client
   has a vsync'd present pending (`infra/xorg-resize-stall.md`), and with the OLED
@@ -918,5 +926,6 @@ backend did that hurt here, rxcom does not do.
   the VRR indicator reads normal and nothing tears. Under the same load the X
   presenter with FFCP drew 72 W with the GPU at P0, GL 42 W at P3 (graphics at
   1.3 GHz, memory at 5 GHz); rxcom used 2.2 to 2.5% of a core instead of 0.5%,
-  Xorg 0.8% either way. GL has been the user's presenter since. Not yet seen: a
-  quiet desktop's power and a VT round trip.
+  Xorg 0.8% either way. The first VT round trip hung (9.1), and the user went
+  back to the X presenter with FFCP. Not yet seen: a VT round trip with the
+  fix, and a quiet desktop's power.

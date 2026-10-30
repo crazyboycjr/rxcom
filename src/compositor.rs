@@ -746,7 +746,11 @@ impl Compositor {
     }
 
     fn wants_frame(&self) -> bool {
-        self.scene.dirty || self.full_present || self.zoom.animating() || self.view() != self.shown
+        self.scene.dirty
+            || self.full_present
+            || self.zoom.animating()
+            || self.view() != self.shown
+            || self.gl.as_ref().is_some_and(Gl::missed)
     }
 
     /// Whether vblanks arrive: a monitor is lit, the screen saver has not
