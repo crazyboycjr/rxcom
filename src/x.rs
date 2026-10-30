@@ -324,33 +324,31 @@ impl X {
         Some([r.root_x, r.root_y])
     }
 
-    /// The refresh rate of the fastest lit monitor, if RandR reports one.
-    pub fn max_refresh(&self) -> Option<f64> {
-        if !self.randr {
-            return None;
-        }
-        let res = self.conn.randr_get_screen_resources_current(self.root).ok()?.reply().ok()?;
-        let cookies: Vec<_> = res
-            .crtcs
-            .iter()
-            .filter_map(|&crtc| self.conn.randr_get_crtc_info(crtc, res.config_timestamp).ok())
-            .collect();
-        cookies
-            .into_iter()
-            .filter_map(|c| c.reply().ok())
-            .filter_map(|crtc| res.modes.iter().find(|m| m.id == crtc.mode))
-            .map(|m| {
-                let mut lines = f64::from(m.vtotal);
-                if m.mode_flags.contains(randr::ModeFlag::DOUBLE_SCAN) {
-                    lines *= 2.0;
-                }
-                if m.mode_flags.contains(randr::ModeFlag::INTERLACE) {
-                    lines /= 2.0;
-                }
-                f64::from(m.dot_clock) / (f64::from(m.htotal) * lines)
-            })
-            .filter(|hz| hz.is_finite() && *hz > 0.0)
-            .reduce(f64::max)
+    /// Whether a monitor is lit (a CRTC has a mode; without RandR, assumed),
+    /// and the refresh rate of the fastest whose mode has timings.
+    pub fn monitors(&self) -> (bool, Option<f64>) {
+        let modes = || -> Option<Vec<randr::ModeInfo>> {
+            let res = self.conn.randr_get_screen_resources_current(self.root).ok()?.reply().ok()?;
+            let cookies: Vec<_> = res
+                .crtcs
+                .iter()
+                .filter_map(|&crtc| self.conn.randr_get_crtc_info(crtc, res.config_timestamp).ok())
+                .collect();
+            let lit = cookies.into_iter().filter_map(|c| c.reply().ok()).filter(|crtc| crtc.mode != 0);
+            Some(lit.filter_map(|crtc| res.modes.iter().find(|m| m.id == crtc.mode).copied()).collect())
+        };
+        let Some(modes) = (if self.randr { modes() } else { None }) else { return (true, None) };
+        let hz = modes.iter().map(|m| {
+            let mut lines = f64::from(m.vtotal);
+            if m.mode_flags.contains(randr::ModeFlag::DOUBLE_SCAN) {
+                lines *= 2.0;
+            }
+            if m.mode_flags.contains(randr::ModeFlag::INTERLACE) {
+                lines /= 2.0;
+            }
+            f64::from(m.dot_clock) / (f64::from(m.htotal) * lines)
+        });
+        (!modes.is_empty(), hz.filter(|hz| hz.is_finite() && *hz > 0.0).reduce(f64::max))
     }
 
     /// The VT the X server runs on, which Xorg announces on the root window.

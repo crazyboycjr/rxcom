@@ -225,7 +225,7 @@ impl Compositor {
         };
         let now = Instant::now();
         let zoom = Zoom::new(x.root_cardinal(x.atoms.screen_zoom, AtomEnum::CARDINAL), now);
-        let refresh = x.max_refresh();
+        let (lit, refresh) = x.monitors();
         let min_interval = frame_interval(refresh, opts.max_fps);
         let saver = x.saver_on();
         let mut c = Compositor {
@@ -259,7 +259,7 @@ impl Compositor {
             last_present: None,
             content: 0,
             continuous: opts.continuous,
-            lit: refresh.is_some(),
+            lit,
             saver,
             max_fps: opts.max_fps,
             present_mode: opts.present_mode,
@@ -477,12 +477,12 @@ impl Compositor {
                 }
             }
             Event::RandrNotify(_) => {
-                let refresh = self.x.max_refresh();
+                let (lit, refresh) = self.x.monitors();
                 let interval = frame_interval(refresh, self.max_fps);
-                if interval != self.min_interval || refresh.is_some() != self.lit {
-                    let lit = if refresh.is_some() { "" } else { ", none lit" };
-                    log::info!("monitors changed: up to {:.0} fps{lit}", 1.0 / interval.as_secs_f64());
-                    (self.min_interval, self.lit) = (interval, refresh.is_some());
+                if interval != self.min_interval || lit != self.lit {
+                    let none = if lit { "" } else { ", none lit" };
+                    log::info!("monitors changed: up to {:.0} fps{none}", 1.0 / interval.as_secs_f64());
+                    (self.min_interval, self.lit) = (interval, lit);
                 }
             }
             Event::ScreensaverNotify(e) => {
