@@ -2,6 +2,7 @@
 //! the examples (test clients) can reuse the pieces.
 
 pub mod compositor;
+pub mod gl;
 pub mod gpu;
 pub mod logger;
 pub mod scene;

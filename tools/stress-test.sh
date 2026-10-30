@@ -9,7 +9,8 @@
 #   CARGO_TARGET_DIR=... tools/stress-test.sh [display number] [steps]
 #
 # With RXCOM_TEST_EXTERNAL=1 the display must already be running (for example
-# tools/xwayland.sh, so rxcom presents with Vulkan) and is left running.
+# tools/xwayland.sh) and is left running. RXCOM_TEST_PRESENT=gl or vulkan picks
+# rxcom's presenter (default x).
 set -uo pipefail
 n=${1:-24}
 steps=${2:-300}
@@ -38,7 +39,7 @@ feh --no-fehbg --bg-tile "$out/wall1.png"
 XDG_CONFIG_HOME=$scratch/xdg openbox --config-file /etc/xdg/openbox/rc.xml >"$out/openbox.log" 2>&1 &
 pids+=($!)
 sleep 1
-"$bin/rxcom" -v >"$out/rxcom.log" 2>&1 &
+"$bin/rxcom" --present "${RXCOM_TEST_PRESENT:-x}" -v >"$out/rxcom.log" 2>&1 &
 rx=$!
 sleep 1.5
 

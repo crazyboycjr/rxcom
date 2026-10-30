@@ -28,6 +28,10 @@ pub struct Scene {
     /// Copies parts of the scene into stand-ins.
     gc: u32,
     pub dirty: bool,
+    /// A box around the damage, for a presenter that redraws only part of the
+    /// screen; whole windows, since a damage event tells only where its first
+    /// drawing went.
+    pub bounds: Option<Rectangle>,
     /// Painted in full at least once, so its contents can be copied.
     complete: bool,
     /// The zoom view `source` is transformed for.
@@ -36,6 +40,15 @@ pub struct Scene {
 
 fn fixed(v: f64) -> i32 {
     (v * 65536.0).round() as i32
+}
+
+/// The smallest rectangle around both.
+pub fn union(a: Rectangle, b: Rectangle) -> Rectangle {
+    let end = |p: i16, len: u16| i32::from(p) + i32::from(len);
+    let (x, y) = (a.x.min(b.x), a.y.min(b.y));
+    let width = (end(a.x, a.width).max(end(b.x, b.width)) - i32::from(x)) as u16;
+    let height = (end(a.y, a.height).max(end(b.y, b.height)) - i32::from(y)) as u16;
+    Rectangle { x, y, width, height }
 }
 
 impl Scene {
@@ -67,6 +80,7 @@ impl Scene {
             scratch,
             gc,
             dirty: true,
+            bounds: Some(full),
             complete: false,
             transform: None,
         })
@@ -83,14 +97,19 @@ impl Scene {
     }
 
     /// Collects a window's new damage; `(dx, dy)` is where the window's inside
-    /// (within the border) starts on the screen.
-    pub fn add_window_damage(&mut self, x: &X, damage: u32, dx: i16, dy: i16) -> Result<()> {
+    /// (within the border) starts on the screen, and `area` the whole window.
+    pub fn add_window_damage(&mut self, x: &X, damage: u32, dx: i16, dy: i16, area: Rectangle) -> Result<()> {
         let c = &x.conn;
         c.damage_subtract(damage, NONE, self.scratch)?;
         c.xfixes_translate_region(self.scratch, dx, dy)?;
         c.xfixes_union_region(self.damage, self.scratch, self.damage)?;
-        self.dirty = true;
+        self.extend(area);
         Ok(())
+    }
+
+    fn extend(&mut self, r: Rectangle) {
+        self.bounds = Some(self.bounds.map_or(r, |b| union(b, r)));
+        self.dirty = true;
     }
 
     /// A copy of what the scene shows at `r`, as a pixmap and a picture, or None
@@ -109,13 +128,14 @@ impl Scene {
     pub fn add_rect(&mut self, x: &X, r: Rectangle) -> Result<()> {
         x.conn.xfixes_set_region(self.scratch, &[r])?;
         x.conn.xfixes_union_region(self.damage, self.scratch, self.damage)?;
-        self.dirty = true;
+        self.extend(r);
         Ok(())
     }
 
     pub fn add_all(&mut self, x: &X) -> Result<()> {
-        x.conn.xfixes_set_region(self.damage, &[Rectangle { x: 0, y: 0, width: self.width, height: self.height }])?;
-        self.dirty = true;
+        let all = Rectangle { x: 0, y: 0, width: self.width, height: self.height };
+        x.conn.xfixes_set_region(self.damage, &[all])?;
+        self.extend(all);
         Ok(())
     }
 
@@ -141,7 +161,7 @@ impl Scene {
 
     pub fn clear_damage(&mut self, x: &X) -> Result<()> {
         x.conn.xfixes_set_region(self.damage, &[])?;
-        self.dirty = false;
+        (self.dirty, self.bounds) = (false, None);
         Ok(())
     }
 

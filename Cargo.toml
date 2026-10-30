@@ -9,8 +9,10 @@ license = "MIT"
 [dependencies]
 anyhow = "1"
 ash = "0.38"
+glow = "0.17"
 libc = "0.2"
 log = "0.4"
+x11-dl = "2.21"
 x11rb = { version = "0.14", features = ["allow-unsafe-code", "composite", "damage", "dri3", "randr", "render", "screensaver", "shape", "sync", "xfixes", "xinput"] }
 
 [profile.release]

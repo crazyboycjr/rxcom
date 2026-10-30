@@ -32,6 +32,9 @@ pub struct Atoms {
     pub bypass_compositor: u32,
 }
 
+/// The sequence number of a round trip begun with `X::marker`.
+pub struct Marker(u64);
+
 /// A picture format and whether it carries alpha.
 #[derive(Clone, Copy, Debug)]
 pub struct Format {
@@ -406,6 +409,22 @@ impl X {
             bail!("pixmap has {} planes at {} bpp", r.buffers.len(), r.bpp);
         }
         Ok((r.buffers.remove(0), r.strides[0], r.offsets[0], r.modifier))
+    }
+
+    /// Begins a round trip whose reply `reached` collects later, usually long
+    /// after it arrived: then the X server has processed every request sent
+    /// before it, without rxcom having waited for that.
+    pub fn marker(&self) -> Result<Marker> {
+        let cookie = self.conn.get_input_focus()?;
+        let seq = cookie.sequence_number();
+        // A dropped cookie would have its reply discarded.
+        std::mem::forget(cookie);
+        Ok(Marker(seq))
+    }
+
+    pub fn reached(&self, m: Marker) -> Result<()> {
+        self.conn.wait_for_reply(m.0)?;
+        Ok(())
     }
 
     pub fn create_fence(&self) -> Result<u32> {

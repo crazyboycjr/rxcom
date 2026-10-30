@@ -9,6 +9,8 @@
 #
 # With RXCOM_TEST_EXTERNAL=1 the display must already be running (for example
 # tools/xwayland.sh) and is left running; the stall check is skipped there.
+# RXCOM_TEST_PRESENT=gl or vulkan picks rxcom's presenter (default x), and the
+# suite fails if rxcom falls back to the X presenter.
 #
 # Build first: cargo build --all-targets. Screenshots and logs go to
 # $RXCOM_SCRATCH/shots/run (default $XDG_CACHE_HOME/rxcom-test). The real
@@ -31,6 +33,7 @@ shot() { import -window root "$out/$1.png"; }
 pids=()
 rx=
 external=${RXCOM_TEST_EXTERNAL:-}
+present=(--present "${RXCOM_TEST_PRESENT:-x}")
 cleanup() {
 	[ -n "$rx" ] && kill "$rx" 2>/dev/null
 	kill "${pids[@]}" 2>/dev/null
@@ -39,6 +42,8 @@ cleanup() {
 trap cleanup EXIT
 
 [ -n "$external" ] || "$here/nested.sh" start "$n" || exit 1
+# A server left running may have blanked its screen by now.
+xset s reset
 magick -size 1920x1080 gradient:'#203050'-'#a07040' -fill white -draw 'circle 960,540 960,700' \
 	"$out/wallpaper.png"
 feh --no-fehbg --bg-tile "$out/wallpaper.png"
@@ -65,7 +70,7 @@ xdotool windowfocus "$(xdotool search --name '^quad24$')"
 sleep 0.3
 shot ref_plain
 
-"$bin/rxcom" -v >"$out/rxcom.log" 2>&1 &
+"$bin/rxcom" "${present[@]}" -v >"$out/rxcom.log" 2>&1 &
 rx=$!
 sleep 2
 
@@ -74,7 +79,13 @@ shot plain
 check python3 "$here/compare.py" "$out/ref_plain.png" "$out/plain.png" \
 	--ignore 300,250,300,200 --ignore 1100,300,500,160
 echo "   a second instance refuses to start:"
-check grep -q "another compositor is running" <("$bin/rxcom" 2>&1)
+check grep -q "another compositor is running" <("$bin/rxcom" "${present[@]}" 2>&1)
+case ${RXCOM_TEST_PRESENT:-x} in
+gl | vulkan)
+	echo "   the ${RXCOM_TEST_PRESENT} presenter presents, not the X server:"
+	check grep -qi "presenting with ${RXCOM_TEST_PRESENT}" "$out/rxcom.log"
+	;;
+esac
 
 echo "2. ARGB windows blend as premultiplied alpha"
 check python3 "$here/argbcheck.py" "$out/ref_below.png" "$out/plain.png" 300,250,300,200 80800000
@@ -359,7 +370,7 @@ shot ref_after
 check python3 "$here/compare.py" "$out/ref_after.png" "$out/before_exit.png" --ignore 1100,300,500,160
 echo "   the selection is free again; a new instance with --zoom-filter linear and FIFO, at 3x:"
 xdotool mousemove 700 400
-"$bin/rxcom" --zoom-filter linear --present-mode fifo >"$out/rxcom2.log" 2>&1 &
+"$bin/rxcom" "${present[@]}" --zoom-filter linear --present-mode fifo >"$out/rxcom2.log" 2>&1 &
 rx=$!
 sleep 1.5
 shot unzoomed2
@@ -381,7 +392,7 @@ echo "   SIGTERM is honoured while frames render back to back (presenting only o
 "$bin/examples/argbwin" --geometry 600x80+200+950 --depth 32 --color ff00a0ff --animate --name anim2 &
 anim2=$!
 pids+=($anim2)
-"$bin/rxcom" --no-continuous >"$out/rxcom3.log" 2>&1 &
+"$bin/rxcom" "${present[@]}" --no-continuous >"$out/rxcom3.log" 2>&1 &
 rx=$!
 sleep 1.5
 start=$(date +%s%N)
@@ -392,11 +403,27 @@ rx=
 echo "   exited with status $status after $((($(date +%s%N) - start) / 1000000)) ms"
 check grep -q "released the screen" "$out/rxcom3.log"
 kill "$anim2"
+if [ "${RXCOM_TEST_PRESENT:-x}" = gl ]; then
+	echo "   GL started under the screen saver waits for it, the X server presenting meanwhile:"
+	xset s activate
+	"$bin/rxcom" "${present[@]}" -v >"$out/rxcom5.log" 2>&1 &
+	rx=$!
+	sleep 1.5
+	check grep -q "GL waits for vblanks" "$out/rxcom5.log"
+	check test "$(grep -c "presenting with GL" "$out/rxcom5.log")" -eq 0
+	xset s reset
+	sleep 1
+	check grep -q "presenting with GL" "$out/rxcom5.log"
+	kill -TERM "$rx"
+	wait "$rx"
+	rx=
+	check grep -q "released the screen" "$out/rxcom5.log"
+fi
 
 if [ -z "$external" ]; then
 	echo "9. the X server stops answering for 7 s mid-zoom: the watchdog warns, rxcom"
 	echo "   waits it out and carries on"
-	"$bin/rxcom" >"$out/rxcom4.log" 2>&1 &
+	"$bin/rxcom" "${present[@]}" >"$out/rxcom4.log" 2>&1 &
 	rx=$!
 	sleep 1.5
 	shot before_hang

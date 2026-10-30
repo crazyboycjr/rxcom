@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use rxcom::compositor::{Compositor, Options};
+use rxcom::compositor::{Compositor, Options, Presenter};
 use std::os::fd::RawFd;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
@@ -9,7 +9,9 @@ rxcom: an X11 compositor with a desktop zoom
 
 usage: rxcom [options]
   -d, --display NAME      X display (default $DISPLAY)
-  --x-present             let the X server present (may tear) instead of Vulkan
+  --present P             what puts the desktop on the screen: x (the X server
+                          copies it; may tear; the default), gl or vulkan
+  --x-present             the same as --present x
   --unredirect-delay MS   give the screen to a full-screen opaque window
                           (a game) after MS milliseconds (default 200)
   --no-unredirect         always composite
@@ -28,10 +30,12 @@ Zoom: the window manager sets the root property _SCREEN_ZOOM (CARDINAL/32,
   xprop -root -f _SCREEN_ZOOM 32c -set _SCREEN_ZOOM 131072
   xprop -root -remove _SCREEN_ZOOM
 
-The Vulkan presenter presents at every refresh, even when nothing changed, so
-that a variable-refresh (G-SYNC, FreeSync) monitor stays at its top rate:
-NVIDIA gives Vulkan applications on X no way to opt out of variable refresh.
-Presenting an unchanged frame copies nothing.
+gl and vulkan flip at vblank, so they never tear. GL presents only what
+changed; it sets __GL_VRR_ALLOWED=0 for itself unless that is set already,
+which keeps a G-SYNC or FreeSync monitor at its fixed refresh rate on NVIDIA.
+Vulkan presents at every refresh, even when nothing changed, so that such a
+monitor stays at its top rate: NVIDIA gives Vulkan applications on X no way to
+opt out of variable refresh. Presenting an unchanged frame copies nothing.
 ";
 
 /// Stops rxcom if one turn of its loop is stuck for longer than this.
@@ -40,7 +44,7 @@ const WATCHDOG: Duration = Duration::from_secs(5);
 fn parse_args() -> Result<(Options, u8)> {
     let mut o = Options {
         display: None,
-        vulkan: true,
+        presenter: Presenter::X,
         unredirect_delay: Some(Duration::from_millis(200)),
         linear: false,
         max_fps: None,
@@ -54,7 +58,15 @@ fn parse_args() -> Result<(Options, u8)> {
         let mut value = || args.next().with_context(|| format!("{a} needs a value"));
         match a.as_str() {
             "-d" | "--display" => o.display = Some(value()?),
-            "--x-present" => o.vulkan = false,
+            "--present" => {
+                o.presenter = match value()?.as_str() {
+                    "x" => Presenter::X,
+                    "gl" => Presenter::Gl,
+                    "vulkan" => Presenter::Vulkan,
+                    p => bail!("--present: {p} is not x, gl or vulkan"),
+                }
+            }
+            "--x-present" => o.presenter = Presenter::X,
             "--unredirect-delay" => {
                 o.unredirect_delay = Some(Duration::from_millis(value()?.parse().context("--unredirect-delay")?))
             }
@@ -145,6 +157,12 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // NVIDIA's OpenGL honours this, as its profiles set it for the compositors
+    // they know; libGL is not loaded yet, and no other thread runs.
+    if opts.presenter == Presenter::Gl && std::env::var_os("__GL_VRR_ALLOWED").is_none() {
+        // SAFETY: the process has no other thread yet.
+        unsafe { std::env::set_var("__GL_VRR_ALLOWED", "0") };
+    }
     rxcom::logger::init(verbose);
     let result = signal_fd().and_then(|sigfd| {
         rxcom::watchdog::start(WATCHDOG);

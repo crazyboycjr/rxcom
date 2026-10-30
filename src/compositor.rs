@@ -1,5 +1,6 @@
 //! The compositor: X events in, frames out.
 
+use crate::gl::{self, Gl};
 use crate::gpu::Gpu;
 use crate::scene::{Background, Scene};
 use crate::vt::Vt;
@@ -25,10 +26,22 @@ use x11rb::protocol::xproto::{
     MapState, Place, Property, Rectangle, Window, WindowClass,
 };
 
+/// What puts the composed desktop on the screen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Presenter {
+    /// The X server copies the scene onto the overlay window; it may tear.
+    X,
+    /// A Vulkan swapchain on the overlay window, where the X server can share
+    /// the scene through DRI3.
+    Vulkan,
+    /// GLX on the overlay window, with the scene bound as a texture.
+    Gl,
+}
+
 pub struct Options {
     pub display: Option<String>,
-    /// Present with Vulkan when the X server can share the scene.
-    pub vulkan: bool,
+    /// Where it fails, the X server presents.
+    pub presenter: Presenter,
     /// Unredirect a full-screen opaque window after this long; None: never.
     pub unredirect_delay: Option<Duration>,
     pub linear: bool,
@@ -91,8 +104,12 @@ pub struct Compositor {
     background: Background,
     overlay_picture: u32,
     gpu: Option<Gpu>,
-    /// Present with Vulkan whenever it works.
-    vulkan: bool,
+    gl: Option<Gl>,
+    /// GL is to be set up for the current scene once vblanks arrive: until
+    /// then NVIDIA's texture-from-pixmap calls could wait for one forever.
+    gl_pending: bool,
+    /// The presenter asked for, used whenever it works.
+    presenter: Presenter,
     /// GPU errors without a quiet minute in between, and the last one.
     gpu_failures: u32,
     last_failure: Option<Instant>,
@@ -170,6 +187,21 @@ fn try_gpu(x: &X, display: Option<&str>, mode: Option<ash::vk::PresentModeKHR>) 
     }
 }
 
+/// The GL presenter showing `scene`, or None when GL cannot present here and
+/// the X server will.
+fn try_gl(x: &X, display: Option<&str>, scene: u32) -> Option<Gl> {
+    match Gl::new(x, display, scene) {
+        Ok(gl) => {
+            log::info!("presenting with {}", gl.route);
+            Some(gl)
+        }
+        Err(e) => {
+            log::warn!("GL cannot present here ({e:#}); the X server presents");
+            None
+        }
+    }
+}
+
 /// Starts watching the window's drawing operation by operation, until its
 /// client has drawn (`Win::witness`).
 fn watch(x: &X, w: &mut Win) {
@@ -210,8 +242,11 @@ impl Compositor {
     pub fn new(opts: &Options) -> Result<Compositor> {
         let mut x = X::connect(opts.display.as_deref())?;
         x.become_compositor()?;
-        let (gpu, pixmap) =
-            if opts.vulkan { try_gpu(&x, opts.display.as_deref(), opts.present_mode) } else { (None, None) };
+        let display = opts.display.as_deref();
+        let (gpu, pixmap) = match opts.presenter {
+            Presenter::Vulkan => try_gpu(&x, display, opts.present_mode),
+            _ => (None, None),
+        };
         let setup = (|| -> Result<_> {
             Ok((Scene::new(&x, pixmap)?, x.create_picture(x.overlay, x.root_format())?, x.create_fence()?))
         })();
@@ -237,7 +272,9 @@ impl Compositor {
             background: Background::new(opts.background),
             overlay_picture,
             gpu,
-            vulkan: opts.vulkan,
+            gl: None,
+            gl_pending: opts.presenter == Presenter::Gl,
+            presenter: opts.presenter,
             gpu_failures: 0,
             last_failure: None,
             fence,
@@ -286,30 +323,67 @@ impl Compositor {
             c.x.width,
             c.x.height
         );
+        if c.gl_pending && !c.vblanks() {
+            log::info!(
+                "GL waits for vblanks (a lit monitor, no screen saver, X's VT); the X server presents until then"
+            );
+        }
+        c.start_gl()?;
         c.x.conn.flush()?;
         Ok(c)
     }
 
-    /// Sets the Vulkan presenter up from scratch with a new scene: after a VT
-    /// switch, a new screen size or a GPU error. The X server presents when that
-    /// fails, or after GPU_RETRIES errors.
+    /// Sets GL up for the current scene once vblanks arrive, in place of any
+    /// for an older scene: NVIDIA's texture-from-pixmap calls wait for a vblank,
+    /// forever while none comes.
+    fn start_gl(&mut self) -> Result<()> {
+        if !self.gl_pending || !self.vblanks() {
+            return Ok(());
+        }
+        self.gl_pending = false;
+        self.drop_gl();
+        self.gl = try_gl(&self.x, self.display.as_deref(), self.scene.pixmap);
+        self.repaint_all()
+    }
+
+    /// Ends the GL presenter. Without vblanks, unbinding the scene could wait
+    /// for one forever, so then it is abandoned to the process's exit.
+    fn drop_gl(&mut self) {
+        if let Some(mut gl) = self.gl.take() {
+            gl.release(&self.x);
+            if !self.vblanks() {
+                std::mem::forget(gl);
+            }
+        }
+    }
+
+    /// Sets the presenter up from scratch with a new scene: after a VT switch
+    /// (Vulkan), a new screen size or a GPU error. The X server presents when
+    /// that fails, or after GPU_RETRIES errors. GL moves to the new scene once
+    /// vblanks allow; until then no frame is drawn.
     fn rebuild_gpu(&mut self, why: &str) -> Result<()> {
         log::info!("{why}: setting the presenter up again");
         self.gpu = None;
-        let pixmap = match (self.vulkan, self.gpu_failures < GPU_RETRIES) {
-            (true, true) => {
-                let (gpu, pixmap) = try_gpu(&self.x, self.display.as_deref(), self.present_mode);
+        let retry = self.gpu_failures < GPU_RETRIES;
+        if !retry && self.presenter != Presenter::X {
+            log::warn!("{GPU_RETRIES} GPU errors in a row; the X server presents for now");
+        }
+        let display = self.display.as_deref();
+        let pixmap = match self.presenter {
+            Presenter::Vulkan if retry => {
+                let (gpu, pixmap) = try_gpu(&self.x, display, self.present_mode);
                 self.gpu = gpu;
                 pixmap
             }
-            (true, false) => {
-                log::warn!("{GPU_RETRIES} GPU errors in a row; the X server presents for now");
-                None
-            }
-            (false, _) => None,
+            _ => None,
         };
         self.scene.destroy(&self.x);
         self.scene = Scene::new(&self.x, pixmap)?;
+        self.gl_pending = self.presenter == Presenter::Gl && retry;
+        if !self.gl_pending {
+            self.drop_gl();
+        }
+        self.start_gl()?;
         self.blocked_since = None;
         self.repaint_all()
     }
@@ -541,7 +615,7 @@ impl Compositor {
                         // border (xmonad's focus colour) lies at negative coordinates.
                         let b = w.geom.border as i16;
                         let (dx, dy) = (w.geom.x + b, w.geom.y + b);
-                        self.scene.add_window_damage(&self.x, e.damage, dx, dy)?;
+                        self.scene.add_window_damage(&self.x, e.damage, dx, dy, w.geom.outer())?;
                     }
                     // Not on screen, about to be redrawn whole, behind its
                     // stand-in, or a witness already gone.
@@ -675,25 +749,29 @@ impl Compositor {
         self.scene.dirty || self.full_present || self.zoom.animating() || self.view() != self.shown
     }
 
-    /// Whether to present at every refresh: with Vulkan, while compositing, on
-    /// a lit monitor the screen saver has not blanked and on the X server's VT.
-    /// A variable-refresh monitor then stays at its top rate instead of
-    /// following the desktop's pauses.
+    /// Whether vblanks arrive: a monitor is lit, the screen saver has not
+    /// blanked it, and the X server's VT is in front.
+    fn vblanks(&self) -> bool {
+        self.lit && !self.saver && self.vt.as_ref().is_none_or(Vt::ours)
+    }
+
+    /// Whether to present at every refresh: with Vulkan, while compositing and
+    /// vblanks arrive. A variable-refresh monitor then stays at its top rate
+    /// instead of following the desktop's pauses.
     fn continuous_now(&self) -> bool {
         self.continuous
             && self.gpu.as_ref().is_some_and(Gpu::keeps_newest)
             && self.unredirected.is_none()
-            && self.lit
-            && !self.saver
-            && self.vt.as_ref().is_none_or(Vt::ours)
+            && self.vblanks()
     }
 
     /// When the next frame is due, if one is: once something changed, at most
     /// at the frame limit, and while continuous, a refresh after the last
     /// present. A present that only keeps up with the refresh never delays a
     /// frame with news, which supersedes it if both wait for the same vblank.
+    /// GL swaps nothing while no vblanks arrive, since its swap would wait.
     fn next_frame(&self, now: Instant) -> Option<Instant> {
-        if self.unredirected.is_some() {
+        if self.unredirected.is_some() || (self.gl.is_some() && !self.vblanks()) {
             return None;
         }
         let continuous = self.continuous_now();
@@ -737,6 +815,11 @@ impl Compositor {
     fn frame(&mut self, now: Instant) -> Result<Option<Duration>> {
         let news = self.wants_frame();
         let painted = self.scene.dirty;
+        if let Some(gl) = &mut self.gl
+            && !gl.ready(&self.x, painted)?
+        {
+            return Ok(Some(Duration::from_millis(1)));
+        }
         if let Some(gpu) = &mut self.gpu {
             if (painted && !gpu.scene_free()?) || !gpu.acquire()? {
                 let since = *self.blocked_since.get_or_insert(now);
@@ -765,25 +848,20 @@ impl Compositor {
             self.scene.paint(&self.x, &self.background, self.wins.iter())?;
             self.stats.composed += 1;
         }
-        if let Some(gpu) = &mut self.gpu {
-            if painted {
-                self.scene.clear_damage(&self.x)?;
-                let start = Instant::now();
-                if self.x.sync_gpu(self.fence, FENCE_LIMIT)? {
-                    self.stats.fence_sum += start.elapsed();
-                    self.stats.fence_max = self.stats.fence_max.max(start.elapsed());
-                } else {
-                    // Its trigger may be lost for good; draw anyway, with a new fence.
-                    if self.stats.fence_timeouts == 0 {
-                        log::warn!("the X server's fence did not trigger within {} ms", FENCE_LIMIT.as_millis());
-                    }
-                    self.stats.fence_timeouts += 1;
-                    self.x.conn.sync_destroy_fence(self.fence)?;
-                    self.fence = self.x.create_fence()?;
-                    self.scene.add_all(&self.x)?;
-                }
+        let damage = self.scene.bounds.filter(|_| painted);
+        if painted && (self.gpu.is_some() || self.gl.is_some()) {
+            self.scene.clear_damage(&self.x)?;
+            if !self.gl.as_ref().is_some_and(Gl::waits_on_gpu) {
+                self.wait_for_composition()?;
             }
+        }
+        if let Some(gpu) = &mut self.gpu {
             if gpu.draw(view.unwrap_or(View::IDENTITY), self.linear, self.content)? {
+                self.stats.drawn += 1;
+            }
+        } else if let Some(gl) = &mut self.gl {
+            let full = self.full_present || view.is_some() || view != self.shown;
+            if gl.draw(&self.x, view.unwrap_or(View::IDENTITY), self.linear, damage, full)? {
                 self.stats.drawn += 1;
             }
         } else {
@@ -802,10 +880,35 @@ impl Compositor {
         Ok(None)
     }
 
-    /// A GPU error ends the Vulkan presenter; rebuild it, or let X present.
+    /// Polls until the X server's GPU has finished the composition, for at
+    /// most FENCE_LIMIT; past that the frame goes out anyway and the next one
+    /// repaints the whole scene.
+    fn wait_for_composition(&mut self) -> Result<()> {
+        let start = Instant::now();
+        if self.x.sync_gpu(self.fence, FENCE_LIMIT)? {
+            self.stats.fence_sum += start.elapsed();
+            self.stats.fence_max = self.stats.fence_max.max(start.elapsed());
+        } else {
+            // Its trigger may be lost for good; draw anyway, with a new fence.
+            if self.stats.fence_timeouts == 0 {
+                log::warn!("the X server's fence did not trigger within {} ms", FENCE_LIMIT.as_millis());
+            }
+            self.stats.fence_timeouts += 1;
+            self.x.conn.sync_destroy_fence(self.fence)?;
+            self.fence = self.x.create_fence()?;
+            self.scene.add_all(&self.x)?;
+        }
+        Ok(())
+    }
+
+    /// A GPU error ends the Vulkan or GL presenter: set it up again at once,
+    /// or let X present.
     fn frame_or_recover(&mut self, now: Instant) -> Result<Option<Duration>> {
         match self.frame(now) {
-            Err(e) if self.gpu.is_some() && e.downcast_ref::<ash::vk::Result>().is_some() => {
+            Err(e)
+                if (self.gpu.is_some() && e.downcast_ref::<ash::vk::Result>().is_some())
+                    || (self.gl.is_some() && e.downcast_ref::<gl::Lost>().is_some()) =>
+            {
                 if self.last_failure.is_some_and(|t| now - t > Duration::from_secs(60)) {
                     self.gpu_failures = 0;
                 }
@@ -822,9 +925,12 @@ impl Compositor {
             return;
         }
         let s = std::mem::take(&mut self.stats);
+        let gl = self.gl.as_mut().map(Gl::take_stats).map_or(String::new(), |(partial, swap)| {
+            format!("; {partial} partial redraws, the slowest swap call took {:.2} ms", swap.as_secs_f64() * 1e3)
+        });
         log::debug!(
             "{} frames in {:.0} s, {} composed, {} drawn, {} waited for a free image; X's GPU work took {:.2} ms \
-             a composition on average, at most {:.2} ms; {} fence timeouts; {} damage events",
+             a composition on average, at most {:.2} ms; {} fence timeouts; {} damage events{gl}",
             s.frames,
             (now - self.stats_since).as_secs_f64(),
             s.composed,
@@ -849,7 +955,15 @@ impl Compositor {
                 return Ok(());
             }
             if std::mem::take(&mut vt_changed) && self.vt.as_mut().is_some_and(|vt| vt.returned()) {
-                self.rebuild_gpu("back on the X server's VT")?;
+                // NVIDIA keeps a GL context's memory across VT switches unless
+                // it opted into reports of purged memory, which rxcom's has not.
+                if let Some(gl) = &mut self.gl {
+                    log::info!("back on the X server's VT: repainting everything");
+                    gl.forget_history();
+                    self.repaint_all()?;
+                } else {
+                    self.rebuild_gpu("back on the X server's VT")?;
+                }
             }
             while let Some(ev) = self.x.conn.poll_for_event()? {
                 self.handle(ev)?;
@@ -857,6 +971,7 @@ impl Compositor {
             if self.quit {
                 return Ok(());
             }
+            self.start_gl()?;
             let now = Instant::now();
             let mut timeout: Option<Duration> = None;
             let mut wake = |d: Duration| timeout = Some(timeout.map_or(d, |t| t.min(d)));
@@ -912,6 +1027,7 @@ impl Compositor {
 impl Drop for Compositor {
     fn drop(&mut self) {
         self.gpu.take();
+        self.drop_gl();
         for mut w in self.wins.drain() {
             w.release(&self.x.conn);
             if let Some(d) = w.damage {

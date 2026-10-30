@@ -787,20 +787,21 @@ first trial answers these.
 
 | File | Lines | Role |
 | --- | ---: | --- |
-| `src/main.rs` | 154 | options, signals, start and restart |
-| `src/x.rs` | 444 | connection, extensions, selection, overlay, DRI3, fence, screen saver, helpers |
-| `src/windows.rs` | 198 | the stacking list, each window's X resources and stand-in |
-| `src/scene.rs` | 218 | the XRender composition, stand-ins, the X presenter, the background |
-| `src/compositor.rs` | 920 | events, damage, waiting for clients, frames and their pacing, unredirection, VT, recovery, the loop |
+| `src/main.rs` | 179 | options, signals, start and restart |
+| `src/x.rs` | 468 | connection, extensions, selection, overlay, DRI3, fence, screen saver, helpers |
+| `src/windows.rs` | 201 | the stacking list, each window's X resources and stand-in |
+| `src/scene.rs` | 238 | the XRender composition, its damage, stand-ins, the X presenter, the background |
+| `src/compositor.rs` | 1044 | events, damage, waiting for clients, frames and their pacing, unredirection, VT, recovery, the loop |
 | `src/gpu.rs` | 870 | the Vulkan presenter: the shared scene, the pass, the swapchain and what its images hold |
+| `src/gl.rs` | 759 | the GL presenter: GLX, the bound scene, the imported X fences, buffer age (section 9) |
 | `src/zoom.rs` | 115 | picom-zoom's easing and view |
-| `src/watchdog.rs`, `vt.rs`, `logger.rs`, `lib.rs` | 194 | restarts, the VT watch, logging |
-| `shaders/` | 28 | the full-screen pass |
+| `src/watchdog.rs`, `vt.rs`, `logger.rs`, `lib.rs` | 195 | restarts, the VT watch, logging |
+| `shaders/` | 28 | the Vulkan pass; GL's is in `gl.rs` |
 
-That is about 3,110 lines of Rust without its unit tests, against xcompmgr's
-roughly 2,500 lines of C, which have shadows and fading but no Vulkan, zoom,
-unredirection or recovery. The dependencies are x11rb, ash, libc, log and
-anyhow; glslc builds the shaders.
+That is about 4,070 lines of Rust without its unit tests, against xcompmgr's
+roughly 2,500 lines of C, which have shadows and fading but no Vulkan, GL, zoom,
+unredirection or recovery. The dependencies are x11rb, ash, glow, x11-dl, libc,
+log and anyhow; glslc builds the shaders.
 
 Tested on nested servers only (section 2.5): `tools/nested-test.sh` on Xvfb
 (the X presenter) and on headless Xwayland with the NVIDIA driver and the
@@ -814,3 +815,95 @@ Not used, though NVIDIA 615 offers them: present_id2/present_wait2 and their
 first versions (FIFO_LATEST_READY with a zero-timeout acquire paces without
 them), and VK_EXT_present_timing (not in ash's headers, and nothing needs vblank
 timestamps yet).
+
+## 9. The GL presenter (decided 10-29)
+
+The user's power trial on 10-29 (15:01 to 15:07, hands off for a minute, then a
+minute with one 1280x720 window redrawn 60 times a second) measured:
+
+| Setup | Idle | Animated | Xorg's CPU |
+| --- | --- | --- | --- |
+| X presenter, ForceFullCompositionPipeline on | 37.2 W, P3 (memory at 5001 MHz) | 37.4 W | 8% of a core, always |
+| X presenter, FFCP off (tears) | 30.1 W, mostly P5 | 25.2 W, P5 (810 MHz) | 0.3 to 7% |
+| Vulkan, continuous | 38.6 W, P0 (10501 MHz) | 43.4 W | 4 to 18% |
+
+Presenting at every refresh holds the GPU at its top memory clock, and FFCP
+costs as much doing the same inside the driver. GL can flip without tearing,
+like Vulkan, and NVIDIA's OpenGL honours `__GL_VRR_ALLOWED=0` (section 8.5),
+so it can present only what changed and leave the GPU idle otherwise.
+
+### 9.1 Design
+
+X still composes the scene with XRender; GL only shows it. What picom's GLX
+backend did that hurt here, rxcom does not do.
+
+- **GLX, not EGL**: picom's egl backend hit an NVIDIA Xid 31 on this machine on
+  10-24. libGL and libX11 are loaded at run time (x11-dl), with an Xlib
+  connection of GL's own, so the other presenters never load them and
+  `__GL_VRR_ALLOWED` is set before the driver reads it.
+- **No purge reports**: the context is robust where GLX offers it, so a GPU
+  reset reads as a lost context and rxcom sets GL up again at once, but it never
+  opts into `GLX_NV_robustness_video_memory_purge`. That opt-in is what makes
+  NVIDIA report a reset at every VT switch (Chromium's GPU process dies then);
+  without it the driver keeps the context's memory, so a VT switch only repaints.
+- **One texture bound once**: GLX_EXT_texture_from_pixmap binds the scene
+  pixmap when the scene is made. Rebinding per frame or per window is what waits
+  for a vblank inside NVIDIA's Xorg (`infra/xorg-resize-stall.md`). Whether a
+  binding shows later drawing without a rebind is undefined by the extension, so
+  rxcom tests it at start: X fills the scene, GL samples it into one pixel of a
+  back buffer that is never shown, X fills it again, GL samples again. Where the
+  second sample is stale (Mesa's software rasteriser copies the pixmap when
+  binding it), every frame rebinds.
+- **Waiting on the GPU, never in X**: four X fences, each imported once with
+  GL_EXT_x11_sync_object and used in turn, as KWin's X11 compositor does: rxcom
+  triggers one after its composition requests and the GPU waits for it
+  (glWaitSync) before sampling the scene. Once the fence reads signalled, rxcom
+  resets it, and a round trip begun with the reset is collected before the fence
+  is used again, since a GPU wait issued before the X server processed the reset
+  could see the old trigger. The extension leaves resets undefined, so rxcom
+  tests at start that a wait holds until the trigger and does so again after a
+  reset; where it does not hold, rxcom polls with QueryFence as for Vulkan, and
+  where a wait never ends, GL is refused. A fence not triggered after 100 ms is
+  triggered again. Mesa has no such fences and polls.
+- **Only what changed**: swap interval 1 on the overlay window, a frame only
+  when the scene or the view changed, and GLX_EXT_buffer_age to redraw only what
+  the back buffer lacks: the new damage and that of the frames shown since that
+  buffer was (four frames are remembered). Damage is kept as a box around whole
+  windows, since a NonEmpty damage event tells only where a window's first
+  drawing went. A zoomed view, a new view or an unknown age redraws everything.
+- **Nothing blocks**: at most two swaps in flight, judged by GL fences checked
+  without waiting; X composes into the scene only once a fence after the last
+  draw says GL has read it; and no frame is drawn while no vblanks arrive (no lit
+  monitor, the screen saver on, another VT in front), since the swap would wait
+  for one. The slowest swap call of each ten seconds is logged.
+- **Set up only while vblanks arrive**: NVIDIA's glXCreatePixmap,
+  glXBindTexImageEXT and glXDestroyPixmap wait for a vblank whenever some client
+  has a vsync'd present pending (`infra/xorg-resize-stall.md`), and with the OLED
+  off and disconnected none comes. On 10-29 at 17:29 a GL rxcom started that way
+  hung in its first bind, its only thread polling in nanosleep, after it had
+  taken the screen and before the watchdog started. So GL is set up, and moved
+  to a new scene after a RandR change, only while vblanks arrive; the X presenter
+  shows the desktop until then. Without vblanks, ending GL leaves its binding to
+  the process's exit rather than unbind it. The sharing test needs no rebind
+  where the binding shares (NVIDIA), and the watchdog now watches start-up too.
+- **Zoom** maps pixels as the Vulkan shader does, with GL's window and texture
+  rows running up handled in the shader, so the nested suite's exact checks hold.
+- **`--present x|gl|vulkan`**, the X presenter by default until the user's
+  trial; `--x-present` stays as its alias. Where GL cannot present, the X
+  server does.
+
+### 9.2 Tested
+
+- The nested suite and the stress test on Xvfb with Mesa's llvmpipe (the
+  texture rebound every frame, fences polled, full redraws), and the suite on
+  the headless Xwayland with llvmpipe and a robust context, all pass. The suite
+  fails if rxcom falls back to the X presenter (`RXCOM_TEST_PRESENT=gl`), and
+  checks that GL started under the screen saver waits for it to end.
+- On the headless Xwayland NVIDIA's own GLX has no texture_from_pixmap, and
+  Mesa's zink on NVIDIA's Vulkan binds the pixmap but samples black: the start
+  test refuses it, and the X server presents.
+- The buffer age's arithmetic has unit tests.
+- Only the real display shows whether NVIDIA's binding shares the scene, whether
+  its imported fences hold and release, the partial redraws, whether a swap ever
+  blocks, the flips, the VRR indicator reading normal, a VT round trip, and the
+  power the trial compares.
