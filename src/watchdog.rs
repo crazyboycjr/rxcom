@@ -50,10 +50,7 @@ fn restart() {
         log::error!("stuck setting the presenter up; the X server presents from now on");
         args.extend(["--present".into(), "x".into()]);
     }
-    let child = std::process::Command::new("/proc/self/exe")
-        .args(args)
-        .env("RXCOM_RESTARTS", n.to_string())
-        .spawn();
+    let child = std::process::Command::new("/proc/self/exe").args(args).env("RXCOM_RESTARTS", n.to_string()).spawn();
     match child {
         Ok(c) => log::error!("restarting as pid {} (restart {n})", c.id()),
         Err(e) => log::error!("cannot restart: {e}"),
