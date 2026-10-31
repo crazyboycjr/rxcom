@@ -1,11 +1,12 @@
 # Builds the working tree this file sits in.
 pkgname=rxcom
-pkgver=0.2.0
+pkgver=0.3.0
 pkgrel=1
-pkgdesc='X11 compositor with full-desktop zoom'
+pkgdesc='X11 compositor with a full-desktop zoom'
 arch=('x86_64')
+url='https://github.com/crazyboycjr/rxcom'
 license=('MIT')
-depends=('gcc-libs' 'glibc' 'libxcb')
+depends=('glibc' 'libgcc' 'libxcb')
 optdepends=('libglvnd: the experimental GL presenter'
             'libx11: the experimental GL presenter'
             'vulkan-icd-loader: the experimental Vulkan presenter')
@@ -32,6 +33,6 @@ check() {
 package() {
   cd "$startdir/../.."
   install -Dm755 "$srcdir/target/release/rxcom" -t "$pkgdir/usr/bin/"
-  install -Dm644 README.md DESIGN.md -t "$pkgdir/usr/share/doc/$pkgname/"
+  install -Dm644 README.md DESIGN.md CHANGELOG.md -t "$pkgdir/usr/share/doc/$pkgname/"
   install -Dm644 LICENSE -t "$pkgdir/usr/share/licenses/$pkgname/"
 }

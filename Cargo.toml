@@ -1,10 +1,13 @@
 [package]
 name = "rxcom"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.88"
-description = "An X11 compositor with a desktop zoom"
+description = "An X11 compositor with a full-desktop zoom"
 license = "MIT"
+repository = "https://github.com/crazyboycjr/rxcom"
+homepage = "https://crazyboycjr.github.io/rxcom/"
+publish = false
 
 [dependencies]
 anyhow = "1"
