@@ -5,12 +5,13 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 const USAGE: &str = "\
-rxcom: an X11 compositor with a desktop zoom
+rxcom: an X11 compositor with a full-desktop zoom
 
 usage: rxcom [options]
   -d, --display NAME      X display (default $DISPLAY)
-  --present P             what puts the desktop on the screen: x (the X server
-                          copies it; may tear; the default), gl or vulkan
+  --present P             what puts the desktop on the screen: x, the X
+                          server (the default and the supported presenter),
+                          or the experimental gl or vulkan
   --x-present             the same as --present x
   --unredirect-delay MS   give the screen to a full-screen opaque window
                           (a game) after MS milliseconds (default 200)
@@ -18,8 +19,9 @@ usage: rxcom [options]
   --zoom-filter F         nearest (default) or linear
   --max-fps N             frame rate limit (default: the refresh rate of the
                           fastest lit monitor)
-  --present-mode M        latest (FIFO_LATEST_READY, the default where offered),
-                          fifo, relaxed (FIFO_RELAXED) or immediate (tears)
+  --present-mode M        with Vulkan: latest (FIFO_LATEST_READY, the default
+                          where offered), fifo, relaxed (FIFO_RELAXED) or
+                          immediate (tears)
   --no-continuous         with Vulkan, present only when something changed
   --background RRGGBB     colour where no wallpaper is set (default 303030)
   -v, -vv                 more logging (or RXCOM_LOG=debug)
@@ -30,12 +32,19 @@ Zoom: the window manager sets the root property _SCREEN_ZOOM (CARDINAL/32,
   xprop -root -f _SCREEN_ZOOM 32c -set _SCREEN_ZOOM 131072
   xprop -root -remove _SCREEN_ZOOM
 
-gl and vulkan flip at vblank, so they never tear. GL presents only what
-changed; it sets __GL_VRR_ALLOWED=0 for itself unless that is set already,
-which keeps a G-SYNC or FreeSync monitor at its fixed refresh rate on NVIDIA.
-Vulkan presents at every refresh, even when nothing changed, so that such a
-monitor stays at its top rate: NVIDIA gives Vulkan applications on X no way to
-opt out of variable refresh. Presenting an unchanged frame copies nothing.
+The X presenter copies each frame onto the screen, which may tear unless the
+driver keeps the screen tear-free itself (NVIDIA's
+ForceFullCompositionPipeline). gl and vulkan are experimental: they flip at
+vblank, so they never tear, but on NVIDIA they have known problems.
+  gl      It can stall the X server's switch to another VT; with
+          systemd-logind 258 or newer and a rootless X (startx), the
+          keyboard and mouse may not come back. GL presents only what
+          changed, and sets __GL_VRR_ALLOWED=0 for itself unless that is
+          set already.
+  vulkan  Its flips engage variable refresh (G-SYNC, FreeSync), which no
+          setting turns off for one program, so it presents at every
+          refresh, even when nothing changed, and keeps the GPU at its top
+          clocks.
 ";
 
 /// Stops rxcom if one turn of its loop is stuck for longer than this.
@@ -164,6 +173,14 @@ fn main() -> ExitCode {
         unsafe { std::env::set_var("__GL_VRR_ALLOWED", "0") };
     }
     rxcom::logger::init(verbose);
+    let experimental = match opts.presenter {
+        Presenter::X => None,
+        Presenter::Gl => Some("GL"),
+        Presenter::Vulkan => Some("Vulkan"),
+    };
+    if let Some(name) = experimental {
+        log::info!("the {name} presenter is experimental; --present x is the supported one");
+    }
     let result = signal_fd().and_then(|sigfd| {
         rxcom::watchdog::start(WATCHDOG);
         let mut c = start(&opts)?;
