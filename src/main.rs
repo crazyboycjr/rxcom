@@ -28,7 +28,8 @@ usage: rxcom [options]
   -h, --help
 
 Zoom: the window manager sets the root property _SCREEN_ZOOM (CARDINAL/32,
-16.16 fixed point), as for xcompmgr-zoom; for example 2x, then off:
+16.16 fixed point), as for xcompmgr-zoom
+(https://github.com/crazyboycjr/xcompmgr-zoom); for example 2x, then off:
   xprop -root -f _SCREEN_ZOOM 32c -set _SCREEN_ZOOM 131072
   xprop -root -remove _SCREEN_ZOOM
 

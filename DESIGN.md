@@ -450,9 +450,10 @@ after 50 ms.
 The window manager, or any other client, writes the target magnification to
 the root window property `_SCREEN_ZOOM`: CARDINAL, format 32, one value in
 16.16 fixed point. No property, or a value of 65536 or less, means no zoom, and
-values above 16x are clamped to 16x. picom-zoom follows the same rules under
-the name `_PICOM_ZOOM`. A level set before rxcom starts shows at once, without
-easing.
+values above 16x are clamped to 16x.
+[xcompmgr-zoom](https://github.com/crazyboycjr/xcompmgr-zoom) reads the same
+property, and picom-zoom follows the same rules under the name `_PICOM_ZOOM`.
+A level set before rxcom starts shows at once, without easing.
 
 ### 9.2 Easing and mapping
 

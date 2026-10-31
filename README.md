@@ -75,7 +75,9 @@ the view follows it across the desktop.
 The level lives in the root window property `_SCREEN_ZOOM`: CARDINAL, format
 32, one value, the magnification in 16.16 fixed point. No property, or a value
 of 65536 (1x) or less, means no zoom, and anything above 16x counts as 16x.
-From a shell:
+[xcompmgr-zoom](https://github.com/crazyboycjr/xcompmgr-zoom), a fork of
+xcompmgr with the same zoom, reads the same property, so the same bindings
+drive either. From a shell:
 
 ```sh
 xprop -root -f _SCREEN_ZOOM 32c -set _SCREEN_ZOOM 131072   # 2x
