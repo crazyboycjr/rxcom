@@ -33,8 +33,13 @@ C program from the early 2000s.
 So I wanted the smallest, fastest compositor that does just this: no effects,
 no configuration, the composition left to the X server with XRender, and the
 zoom driven by a `_SCREEN_ZOOM` root window property that any window manager
-can set. rxcom is built for that setup first, and its GL and Vulkan presenters
-are experiments. If your desktop looks like mine, read on; if not, the notes on
+can set. I designed and wrote rxcom with an AI coding agent, Claude, and that
+is part of the point: work that used to take months and expert knowledge of
+NVIDIA's X driver, X Sync fences, DRI3, and Vulkan and GL presentation became
+doable in days.
+
+rxcom is built for that setup first, and its GL and Vulkan presenters are
+experiments. If your desktop looks like mine, read on; if not, the notes on
 NVIDIA's X driver in [DESIGN.md](DESIGN.md) may still interest you.
 
 ## What it is
