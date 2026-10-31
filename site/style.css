@@ -257,6 +257,13 @@ figure { margin: 0; }
 .frame video, .frame img { width: 100%; height: auto; }
 .cutout img { width: 100%; height: auto; filter: var(--cutout-shadow); }
 
+/* Why I wrote this: a short letter in a reading column, between the hero
+   and the points. */
+.why { margin-top: 104px; max-width: 760px; }
+.why .kicker { font-family: var(--font-text); font-size: var(--fs-s); line-height: 1.4; }
+.why p { color: var(--ink-2); }
+.why + .points { margin-top: 80px; }
+
 /* The four points */
 .points {
   display: grid;
@@ -439,6 +446,8 @@ tbody th { font-weight: 500; border-bottom: 1px solid var(--rule); padding-top: 
   .hero-media figcaption { text-align: left; }
   .frame { border-radius: 10px; }
   .points { grid-template-columns: 1fr; margin-top: 64px; }
+  .why { margin-top: 64px; }
+  .why + .points { margin-top: 56px; }
   .facts { grid-template-columns: 1fr 1fr; gap: 20px; }
   .facts dt { font-size: 28px; }
   .flow { grid-template-columns: 1fr; gap: 22px; }

@@ -20,6 +20,23 @@
 
 <p><img src="docs/readme-zoom.webp" width="100%" alt="A desktop of three terminals, one showing rxcom's own zoom code; the desktop zooms to 3x around the pointer in six wheel steps, the view follows the pointer to the gap between two windows, where the wallpaper shows through a translucent terminal, and zooms back out"></p>
 
+## Why I wrote this
+
+I run X11 with xmonad on an NVIDIA RTX 4070 SUPER, driving a 4K OLED monitor at
+240 Hz, and I wanted to magnify the whole desktop around the pointer, as macOS
+does, without giving up speed or putting up with tearing. picom with a zoom
+patch kept freezing or going black on NVIDIA: it waits on X Sync fences whose
+wakeups NVIDIA's X server sometimes loses, more often after a VT switch, and
+its GLX path added lag. xcompmgr with the zoom ported to it worked, but it is a
+C program from the early 2000s.
+
+So I wanted the smallest, fastest compositor that does just this: no effects,
+no configuration, the composition left to the X server with XRender, and the
+zoom driven by a `_SCREEN_ZOOM` root window property that any window manager
+can set. rxcom is built for that setup first, and its GL and Vulkan presenters
+are experiments. If your desktop looks like mine, read on; if not, the notes on
+NVIDIA's X driver in [DESIGN.md](DESIGN.md) may still interest you.
+
 ## What it is
 
 rxcom composites the windows of an X11 desktop, and magnifies all of it around
