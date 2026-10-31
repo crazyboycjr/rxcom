@@ -460,7 +460,7 @@ impl Gpu {
             let d = &self.device;
             let req = unsafe { d.get_image_memory_requirements(self.scene) };
             // NVIDIA mishandles a plane offset, so the pixmap's offset goes into
-            // the bind, which the spec treats as equivalent (DESIGN.md 2.1).
+            // the bind, which the spec treats as equivalent (DESIGN.md 4.1).
             if !(offset as u64).is_multiple_of(req.alignment) {
                 bail!("pixmap offset {offset} breaks the alignment {}", req.alignment);
             }
