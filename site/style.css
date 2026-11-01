@@ -257,7 +257,7 @@ figure { margin: 0; }
 .frame video, .frame img { width: 100%; height: auto; }
 .cutout img { width: 100%; height: auto; filter: var(--cutout-shadow); }
 
-/* Why I wrote this: a short letter in a reading column, between the hero
+/* Why I created this: a short letter in a reading column, between the hero
    and the points. */
 .why { margin-top: 104px; max-width: 760px; }
 .why .kicker { font-family: var(--font-text); font-size: var(--fs-s); line-height: 1.4; }

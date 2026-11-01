@@ -20,27 +20,33 @@
 
 <p><img src="docs/readme-zoom.webp" width="100%" alt="A desktop of three terminals, one showing rxcom's own zoom code; the desktop zooms to 3x around the pointer in six wheel steps, the view follows the pointer to the gap between two windows, where the wallpaper shows through a translucent terminal, and zooms back out"></p>
 
-## Why I wrote this
+## Why I created this
 
-I run X11 with xmonad on an NVIDIA RTX 4070 SUPER, driving a 4K OLED monitor at
-240 Hz, and I wanted to magnify the whole desktop around the pointer, as macOS
-does, without giving up speed or putting up with tearing. picom with a zoom
-patch kept freezing or going black on NVIDIA: it waits on X Sync fences whose
-wakeups NVIDIA's X server sometimes loses, more often after a VT switch, and
-its GLX path added lag. xcompmgr with the zoom ported to it worked, but it is a
-C program from the early 2000s.
+I run X11 with xmonad and an X compositor, and I wanted to magnify the whole
+desktop around the pointer, the way macOS does. On Linux, Xfce's xfwm4 and
+Compiz, the window manager behind Ubuntu's Unity, can zoom like that, but
+neither carries over to a setup like mine, and the other ways of zooming never
+felt right. picom has had [a request for it](https://github.com/yshui/picom/issues/43)
+open since 2018, with a bounty, and nobody has taken it on.
 
-So I wanted the smallest, fastest compositor that does just this: no effects,
-no configuration, the composition left to the X server with XRender, and the
-zoom driven by a `_SCREEN_ZOOM` root window property that any window manager
-can set. I designed and wrote rxcom with an AI coding agent, Claude, and that
-is part of the point: work that used to take months and expert knowledge of
+A minimal, working X compositor is not hard to build today with AI, so I built
+one. I designed and wrote rxcom with an AI coding agent, Claude, and that is
+part of the point: work that used to take months and expert knowledge of
 NVIDIA's X driver, X Sync fences, DRI3, and Vulkan and GL presentation became
 doable in days.
 
-rxcom is built for that setup first, and its GL and Vulkan presenters are
-experiments. If your desktop looks like mine, read on; if not, the notes on
-NVIDIA's X driver in [DESIGN.md](DESIGN.md) may still interest you.
+Along the way I added the same zoom to two existing compositors.
+[picom's](https://github.com/crazyboycjr/picom/tree/zoom) works, but on NVIDIA
+its GLX backend added lag and froze or went black at times: it waits on X Sync
+fences whose wakeups NVIDIA's X server sometimes loses, more often after a VT
+switch. [xcompmgr-zoom](https://github.com/crazyboycjr/xcompmgr-zoom) works
+well. All three read the same `_SCREEN_ZOOM` root window property, which any
+window manager can set; rxcom is the smallest and fastest of them, with no
+effects, no configuration, and the composition left to the X server.
+
+Its GL and Vulkan presenters are experiments. If you want the same zoom, read
+on; if not, the notes on NVIDIA's X driver in [DESIGN.md](DESIGN.md) may still
+interest you.
 
 ## What it is
 
